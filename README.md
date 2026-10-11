@@ -20,7 +20,7 @@ Nothing is connected until you sign in. Welcome's last step opens ShadowCode so 
 
 ![Mission Control 5.0 with ShadowCode, Grok Bot and Hermes & OpenClaw in the sidebar](https://www.shadowfetchlinux.org/linux-assets/linux-5.0.0-mission-control.webp)
 
-[Download](https://www.shadowfetchlinux.org/download) · [Screenshots](https://www.shadowfetchlinux.org/screenshots) · [Release notes](RELEASE-5.0.0.md) · [ShadowCode](https://github.com/Shadowfetchapps/ShadowCode)
+[Download](https://www.shadowfetchlinux.org/download) · [Screenshots](https://www.shadowfetchlinux.org/screenshots) · [Release notes](RELEASE-5.0.0.md) · [ShadowCode](https://github.com/ShadowfetchStudio/ShadowCode)
 
 ## Current release
 
@@ -64,7 +64,7 @@ No Shadowfetch account is required. No API keys, account sessions or model weigh
 
 ## Verify and install
 
-The [download page](https://www.shadowfetchlinux.org/download) links the ISO, checksum and detached signature. The SBOM (`sbom-5.0.0.cdx.json`), package manifest (`packages-5.0.0.manifest`) and QA evidence bundle (`evidence-bundle-5.0.0.tar.gz`) are attached to the [v5.0.0 GitHub release](https://github.com/Shadowfetchapps/shadowfetch-linux/releases/tag/v5.0.0). Use the exact accepted filename below. These commands download and verify files; they do not write a USB device.
+The [download page](https://www.shadowfetchlinux.org/download) links the ISO, checksum and detached signature. The SBOM (`sbom-5.0.0.cdx.json`), package manifest (`packages-5.0.0.manifest`) and QA evidence bundle (`evidence-bundle-5.0.0.tar.gz`) are attached to the [v5.0.0 GitHub release](https://github.com/ShadowfetchStudio/shadowfetch-linux/releases/tag/v5.0.0). Use the exact accepted filename below. These commands download and verify files; they do not write a USB device.
 
 ```sh
 ISO='shadowfetch-5.0.0-amd64.iso'
@@ -131,7 +131,7 @@ Source map: `packages/shadowfetch-missions/` contains the queue and execution en
 
 ## Support and contributing
 
-Use [GitHub Issues](https://github.com/Shadowfetchapps/shadowfetch-linux/issues) for bugs, installation reports and hardware notes. Include the exact ISO and checksum result, firmware/boot mode, CPU/GPU/RAM, disk layout, the failing step and redacted `shadowfetch-health --json` output. For mission bugs, include the workflow, state and redacted receipt. Report ShadowCode application bugs to [ShadowCode's tracker](https://github.com/Shadowfetchapps/ShadowCode/issues). Report security-sensitive findings through [SECURITY.md](SECURITY.md).
+Use [GitHub Issues](https://github.com/ShadowfetchStudio/shadowfetch-linux/issues) for bugs, installation reports and hardware notes. Include the exact ISO and checksum result, firmware/boot mode, CPU/GPU/RAM, disk layout, the failing step and redacted `shadowfetch-health --json` output. For mission bugs, include the workflow, state and redacted receipt. Report ShadowCode application bugs to [ShadowCode's tracker](https://github.com/ShadowfetchStudio/ShadowCode/issues). Report security-sensitive findings through [SECURITY.md](SECURITY.md).
 
 Patches to packages, build tools, tests and documentation are welcome. Run `make source-gate` before submitting. Do not post password exports, private keys, tokens, private source files or unredacted account logs.
 
