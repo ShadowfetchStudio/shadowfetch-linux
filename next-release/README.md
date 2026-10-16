@@ -4,13 +4,17 @@ Planning notes and staged files that are deliberately **not** in any
 package. `debian/*.install` lists every shipped file explicitly by path, so
 nothing in this directory can reach a build by accident.
 
-## 3.6 planning
+## 3.6 planning (Secure Boot track)
 
-- [`3.6-secure-boot.md`](3.6-secure-boot.md) — what 3.6 can honestly do
-  about known-issues #1 (unsigned Secure Boot) without Microsoft-trusted
-  keys, without rebuilding the 3.5.0 ISO, and without spending the last
-  of the 4 GiB budget. Phoenix/Fireproof snapshot rollback is already
-  shipped in 3.5.0; this note does not re-open that bet.
+- [`3.6-secure-boot.md`](3.6-secure-boot.md) — what this track can
+  honestly do about unsigned Secure Boot without Microsoft-trusted
+  keys, without rebuilding the 5.0.0 ISO, and without spending the
+  last of the 4 GiB budget. Implementation gates live in
+  [issue #4](https://github.com/ShadowfetchStudio/shadowfetch-linux/issues/4).
+  Phoenix/Fireproof snapshot rollback already shipped in 3.5.0 and is
+  still the 5.0 contract; this note does not re-open that bet. The
+  public known-issues caveat is currently #18 on the 5.0 page; a
+  numbering change is not a claim change.
 
 ## Staged for 2.2.0 — not shipped
 
