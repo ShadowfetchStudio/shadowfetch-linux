@@ -16,10 +16,24 @@ add_failure() {
   failures+=("$1")
 }
 
+# Valid-Until is read from the text the signature covers, never from the file
+# around it: gpgv accepts a clearsigned message with unsigned lines before its
+# header, and a first-match grep of the whole file would believe one of those.
+# So InRelease must be exactly one clearsigned message, and the field is taken
+# from between its armor headers' blank line and the signature block.
 if [[ ! -f "$INRELEASE" ]]; then
   add_failure "missing APT metadata: $INRELEASE"
-elif ! valid_until_line=$(grep -m1 '^Valid-Until:' "$INRELEASE"); then
-  add_failure "missing Valid-Until in $INRELEASE"
+elif [[ $(awk 'NR == 1 { print; exit }' "$INRELEASE") != '-----BEGIN PGP SIGNED MESSAGE-----' \
+        || $(awk 'END { print }' "$INRELEASE") != '-----END PGP SIGNATURE-----' \
+        || $(grep -c -x -e '-----BEGIN PGP SIGNED MESSAGE-----' -e '-----BEGIN PGP SIGNATURE-----' -e '-----END PGP SIGNATURE-----' "$INRELEASE") != 3 ]]; then
+  add_failure "$INRELEASE is not exactly one clearsigned message: text outside the signature is not what apt verifies"
+elif ! valid_until_line=$(awk '
+    /^-----BEGIN PGP SIGNATURE-----$/ { exit }
+    body && /^Valid-Until:/ { print; found = 1; exit }
+    /^$/ { body = 1 }
+    END { exit !found }
+  ' "$INRELEASE"); then
+  add_failure "missing Valid-Until in the signed text of $INRELEASE"
 else
   valid_until_value="${valid_until_line#Valid-Until: }"
   if ! valid_until_epoch=$(date -u -d "$valid_until_value" +%s 2>/dev/null); then
@@ -35,15 +49,24 @@ else
   fi
 fi
 
-if command -v git >/dev/null 2>&1 && git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  tracked_cache=$(git -C "$ROOT" ls-files | grep -E '(^|/)\.wrangler(/|$)' || true)
+# An unusable git is a hard failure, not a skip: without it this check cannot see
+# tracked credential/cache state, and the release would print PRE_RELEASE_CHECK_PASSED
+# having verified nothing.
+if ! command -v git >/dev/null 2>&1; then
+  add_failure "git is not installed: the tracked-credential-state check cannot run"
+elif ! git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  add_failure "git cannot read $ROOT as a work tree: the tracked-credential-state check cannot run"
+elif ! tracked_files=$(git -C "$ROOT" ls-files); then
+  add_failure "git ls-files failed in $ROOT: the tracked-credential-state check cannot run"
+else
+  tracked_cache=$(printf '%s\n' "$tracked_files" | grep -E '(^|/)\.wrangler(/|$)' || true)
   if [[ -n "$tracked_cache" ]]; then
     add_failure "tracked Wrangler cache/state files must be removed from git before release: $(printf '%s' "$tracked_cache" | paste -sd, -)"
   fi
 fi
 
 while IFS= read -r token_file; do
-  add_failure "local write token file present in release tree: ${token_file#$ROOT/}"
+  add_failure "local write token file present in release tree: ${token_file#"$ROOT"/}"
 done < <(
   find "$ROOT" \
     \( -path "$ROOT/.git" -o -path "$ROOT/live-build/chroot" -o -path "$ROOT/live-build/cache" \) -prune \
@@ -72,6 +95,23 @@ else
   ' "$PACKAGES_IDX" | sort -u)
   available=$(awk '/^Package: /{print $2}' "$SOURCES_IDX" | sort -u)
   missing=$(comm -23 <(printf '%s\n' "$required") <(printf '%s\n' "$available"))
+  # A republished upstream binary (ShadowCode) has no .dsc that builds it, so
+  # its corresponding source is published as git archives under
+  # pool/third-party-source/<name>/<version>/ instead (vendor/shadowcode/README.md).
+  # Accept it only when every archive SOURCE-SHA256SUMS names is there and matches.
+  still_missing=""
+  while IFS= read -r name; do
+    [[ -n $name ]] || continue
+    version=$(awk -v p="$name" '/^Package: /{hit=($2==p)} hit && /^Version: /{print $2; exit}' "$PACKAGES_IDX")
+    tps="$REPO_DIR/pool/third-party-source/$name/$version"
+    if [[ -n $version && -s "$tps/SOURCE-SHA256SUMS" ]] \
+      && (cd "$tps" && sha256sum --quiet --strict -c SOURCE-SHA256SUMS >/dev/null 2>&1); then
+      printf 'corresponding-source check: %s %s source published as verified third-party archives\n' "$name" "$version"
+    else
+      still_missing+="$name"$'\n'
+    fi
+  done <<< "$missing"
+  missing=${still_missing%$'\n'}
   if [[ -n "$missing" ]]; then
     add_failure "published binaries with no corresponding source in main/source: $(printf '%s' "$missing" | paste -sd, -)"
   fi

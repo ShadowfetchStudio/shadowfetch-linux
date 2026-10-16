@@ -4,6 +4,11 @@
 # Shadowfetch metas (from our local apt repo, wired in via archives/)
 shadowfetch-desktop
 shadowfetch-creative-base
+# Tested upstream crash-routing protocol plus pickup-only lifecycle correction.
+# Must equal UPSTREAM_VERSION in tools/drkonqi_pickup_contract.py (the ISO gate
+# and tools/tests/test_drkonqi_pickup_contract.py both hold it to that).
+drkonqi=6.7.4-1
+shadowfetch-drkonqi-pickup
 # shadowfetch-nvidia removed from chroot install — moved to first-boot hook
 # (NVIDIA driver DKMS doesn't build cleanly against the chroot's kernel
 # headers; building during first-boot on the real installed kernel works.)
@@ -22,6 +27,8 @@ powerdevil
 bluedevil
 kde-config-sddm
 sddm
+# kwallet-pam (Debian still names it libpam-kwallet5; it drives KWallet 6): creates and unlocks kdewallet with the login password at SDDM login, so Grok Bot/ShadowCode get no wallet prompt. Was only a Recommends of plasma-desktop.
+libpam-kwallet5
 # sddm-theme-debian-breeze — REMOVED v1.0.1 (was hijacking branding with the
 # Debian swirl on the login screen; the 0015-sddm-autologin hook forces breeze.)
 

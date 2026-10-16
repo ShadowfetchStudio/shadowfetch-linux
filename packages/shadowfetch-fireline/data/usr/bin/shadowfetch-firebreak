@@ -1,226 +1,1899 @@
-#!/usr/bin/env bash
-# shadowfetch-firebreak - run any coding agent full-auto, safely contained.
+#!/usr/bin/python3 -IS
+"""Firebreak 4: private filesystem and environment for a named workspace.
+
+A fresh mount namespace exposes system runtimes, selected public /etc files,
+private temporary/home directories and exactly one writable workspace. Additional
+read access and individual credentials require explicit command-line grants.
+"""
+from __future__ import annotations
+import argparse
+import ctypes
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import pwd
+import re
+from pathlib import Path
+import resource
+import shutil
+import socket
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+# BEFORE ANY OF THIS FILE'S OWN LOGIC RUNS. A `sitecustomize.py` on PYTHONPATH
+# executes at interpreter start, before the module body, so an attacker who can
+# set the environment of the process that IS Firebreak runs code inside the
+# program that decides containment -- and can then monkeypatch any function in
+# it while the session record goes on saying "enforced".
 #
-# A backfire: the release is named for the fire you set on purpose to stop the
-# wildfire. Running an autonomous agent with "skip all confirmations" on the
-# bare host IS the wildfire (Replit wiped a prod DB; Gemini CLI deleted files).
-# Firebreak is the cleared line around it:
+# This does not pretend to defend against someone who can replace this file;
+# nothing can. It removes the cheaper version of that: influencing the
+# environment rather than the bytes. Firebreak re-executes itself isolated
+# (-I ignores PYTHON* and the user site directory, -S skips site processing
+# entirely, which is what sitecustomize rides in on) with those variables
+# stripped.
 #
-#   * the whole system is mounted READ-ONLY; only the project workspace is
-#     writable, so an agent cannot touch anything outside what you gave it;
-#   * a Phoenix-style checkpoint of the workspace is taken BEFORE the agent
-#     runs, so "undo everything it did" is one command;
-#   * network can be cut entirely (--net none);
-#   * known credential variables are stripped from the agent's environment by
-#     default, so a prompt-injected agent cannot read your keys;
-#   * every session is written to the audit journal (journald + a manifest).
+# WHAT STOPS THAT RE-EXEC LOOPING IS THE INTERPRETER'S OWN STATE, NOT A TOKEN IN
+# THE ENVIRONMENT. The first version of this guard set
+# SHADOWFETCH_FIREBREAK_ISOLATED=1 and skipped itself whenever it saw that name
+# already set -- which handed the off switch to exactly the attacker the guard
+# names, because anyone who can set PYTHONPATH can set that too. Measured, with
+# both set: an injected sitecustomize was imported, was never re-exec'd away
+# from, and was STILL RESIDENT AT EXIT in the process that decides containment.
+# sys.flags cannot be set from the environment. After our own execve the flags
+# are 1/1 and the environment we BUILT holds no hostile name, so the condition
+# below is false and there is no second exec: termination is by construction
+# rather than by a token anyone can forge.
 #
-# It wraps bubblewrap with unprivileged user namespaces; no setuid, no root.
-set -uo pipefail
+# AND THE PRIMARY DEFENCE IS THE SHEBANG, not this block. `-IS` makes the
+# interpreter isolated from its first instruction, so `site` never imports
+# `sitecustomize` or `usercustomize` and no attacker code runs before this
+# module body at all. Two legs made that necessary, both measured:
+#
+#   * `~/.local/lib/python3.12/site-packages/usercustomize.py` is imported at
+#     interpreter start with NO environment variable set. That directory is
+#     writable by anything running unprivileged in the desktop session, and
+#     Mission Control forwards HOME to this program. A guard that triggers on
+#     a list of variable NAMES cannot see it.
+#   * An injected module runs BEFORE this block, so it can rebind os.execve to
+#     a no-op. The call then returns and execution falls through into the body,
+#     in the poisoned interpreter, with the record still saying `enforced`.
+#
+# This block is kept for the invocation that bypasses the shebang --
+# `python3 /usr/bin/shadowfetch-firebreak` -- where it is the only defence.
+#
+# The hostile set is matched by PREFIX. An enumerated list of the names that
+# exist today is a list that goes stale silently -- the first version omitted
+# PYTHONPLATLIBDIR, PYTHONWARNINGS and every LD_ name but three. Everything the
+# dynamic linker and CPython consult to decide what code to LOAD begins with one
+# of these three prefixes, and -I ignores PYTHON* anyway, so stripping the whole
+# space costs nothing.
+_HOSTILE_PREFIXES = ("LD_", "GLIBC_", "PYTHON")
+if __name__ == "__main__":
+    _hostile = {name for name in os.environ
+                if name.startswith(_HOSTILE_PREFIXES)}
+    if _hostile or not (sys.flags.isolated and sys.flags.no_site):
+        _clean = {k: v for k, v in os.environ.items() if k not in _hostile}
+        try:
+            os.execve("/usr/bin/python3",
+                      ["/usr/bin/python3", "-I", "-S", os.path.abspath(__file__),
+                       *sys.argv[1:]],
+                      _clean)
+        except OSError as _exc:
+            # Fail closed. Continuing here would run the containment decision
+            # in the interpreter the caller shaped, which is the whole thing
+            # this guard exists to prevent.
+            sys.stderr.write(
+                "shadowfetch-firebreak: refusing to decide containment in an "
+                f"interpreter this process cannot isolate ({_exc})\n")
+            raise SystemExit(70)
+        # execve does not return. Reaching this line means something in THIS
+        # interpreter replaced it -- measured: a sitecustomize.py that rebinds
+        # os.execve to a no-op used to fall straight through into the module
+        # body here and run to completion with the attacker resident. An
+        # execve that returns is not an error to report and continue past; it
+        # is the attacker, and the only safe thing left is to not run.
+        sys.stderr.write(
+            "shadowfetch-firebreak: os.execve returned. This interpreter is "
+            "not the one that started, or something in it replaced execve; "
+            "either way this process must not decide containment.\n")
+        raise SystemExit(70)
 
-# QEMU guest-agent probes, system services, and other non-login callers are not
-# required to provide HOME. Resolve it once so even read-only commands such as
-# --version and check remain reliable outside an interactive desktop session.
-if [ -z "${HOME:-}" ]; then
-  HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
-  HOME="${HOME:-/tmp}"
-  export HOME
-fi
+VERSION = "5.0.1"
+CREDENTIALS = {"OPENAI_API_KEY", "CODEX_API_KEY", "ANTHROPIC_API_KEY", "XAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "GROQ_API_KEY", "MISTRAL_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "GITLAB_TOKEN", "HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "CLOUDFLARE_API_TOKEN", "CF_API_TOKEN", "DIGITALOCEAN_TOKEN", "NPM_TOKEN", "PYPI_TOKEN", "DOCKER_PASSWORD", "SSH_AUTH_SOCK"}
+PUBLIC_ETC = ("ld.so.cache", "ld.so.conf", "ld.so.conf.d", "alternatives", "ssl/certs", "ca-certificates", "resolv.conf", "hosts", "nsswitch.conf", "passwd", "group", "localtime", "timezone", "mime.types", "fonts")
 
-VERSION="3.5.0"
-STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/shadowfetch/firebreak"
-WS_ROOT="${SHADOWFETCH_AGENT_WORKSPACES:-$HOME/Workspaces}"
-CHECKPOINT_BIN="${SHADOWFETCH_CHECKPOINT_BIN:-shadowfetch-checkpoint}"
+class Error(Exception):
+    pass
 
-# Fire and Ice (3.1): the element steers the sandbox's network default.
-#   fire -> --net allow unless told otherwise (run hot)
-#   ice  -> --net none  unless told otherwise (run cold; add network deliberately)
-element() {
-  local v="${SHADOWFETCH_ELEMENT:-}"
-  [ -z "$v" ] && [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/shadowfetch/element" ] &&     v="$(head -1 "${XDG_CONFIG_HOME:-$HOME/.config}/shadowfetch/element" | tr -d '[:space:]')"
-  [ -z "$v" ] && [ -f /etc/shadowfetch/element ] && v="$(head -1 /etc/shadowfetch/element | tr -d '[:space:]')"
-  case "$v" in ice) printf 'ice' ;; *) printf 'fire' ;; esac
-}
+def redact(text):
+    """Strip credentials from text on its way to the terminal.
 
-# Credential variables scrubbed from the sandbox by default. A prompt-injected
-# agent that can read its own environment must not find your keys there.
-SCRUB_VARS=(
-  OPENAI_API_KEY ANTHROPIC_API_KEY XAI_API_KEY GEMINI_API_KEY GOOGLE_API_KEY
-  GROQ_API_KEY MISTRAL_API_KEY DEEPSEEK_API_KEY OPENROUTER_API_KEY
-  GITHUB_TOKEN GH_TOKEN GITLAB_TOKEN HF_TOKEN HUGGING_FACE_HUB_TOKEN
-  AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
-  CLOUDFLARE_API_TOKEN CF_API_TOKEN DIGITALOCEAN_TOKEN
-  NPM_TOKEN PYPI_TOKEN DOCKER_PASSWORD SSH_AUTH_SOCK
+    Firebreak's error messages quote a child process's stderr (a failed
+    checkpoint, a failed namespace probe), so they are an output path like any
+    other. The one shared implementation lives in shadowfetch-missions -- which
+    Depends on THIS package, so it cannot be a hard dependency in this
+    direction. Use it when it is installed.
+
+    Without it, fall back to striking out the exact values of the credentials
+    this process was actually handed. That is genuinely narrower than the
+    shared rules (no vendor prefixes, no PEM blocks, no Authorization headers),
+    but it covers the only secret material Firebreak itself is given, and it is
+    never a no-op pretending to be a redactor.
+    """
+    text = str(text)
+    locations = [Path("/usr/lib/shadowfetch/missions")]
+    locations += [parent / "packages/shadowfetch-missions/data/usr/lib/shadowfetch/missions"
+                  for parent in Path(__file__).resolve().parents]
+    for location in locations:
+        if (location / "sf_redact.py").is_file():
+            if str(location) not in sys.path:
+                sys.path.insert(0, str(location))
+            try:
+                from sf_redact import redact as shared
+            except ImportError:
+                break
+            return shared(text)
+    for name in sorted(CREDENTIALS - {"SSH_AUTH_SOCK"}):
+        value = os.environ.get(name)
+        if value and len(value) >= 8:
+            text = text.replace(value, "[REDACTED]")
+    return text
+
+def root():
+    """The workspace root, checked for whose it is.
+
+    A root that exists and belongs to somebody else is the shape found on a QA
+    base image: `~/Workspaces` owned by root, so the desktop user could not
+    create the checkpoint store and the first thing to touch it died with a raw
+    `PermissionError: '/home/<user>/Workspaces/.sf-checkpoints'` -- from
+    whichever call happened to be first, with no statement of the actual
+    problem. Nothing in the packages creates this directory as root; the
+    shipped tool makes it as the invoking user, mode 700. But an image, a
+    restore or a stray `sudo` can, and then every mission on that machine fails
+    somewhere far from the cause.
+
+    Refusing here says the cause once, at the boundary. It does not attempt a
+    repair: changing the ownership of a directory the caller does not own is
+    exactly the privileged operation this codebase makes explicit rather than
+    convenient.
+    """
+    resolved = Path(os.environ.get("SHADOWFETCH_AGENT_WORKSPACES",
+                                   str(Path.home() / "Workspaces"))).expanduser().resolve()
+    try:
+        owner = resolved.stat().st_uid
+    except OSError:
+        return resolved                  # absent is fine; it is created on use
+    if owner != os.getuid():
+        raise Error(
+            "The workspace root " + str(resolved) + " belongs to uid "
+            + str(owner) + ", not to you (uid " + str(os.getuid()) + "). "
+            "Nothing can be created in it, so every mission would fail somewhere "
+            "later with a permission error that does not say this. Give it to "
+            "your own user, or point SHADOWFETCH_AGENT_WORKSPACES somewhere you "
+            "own.")
+    return resolved
+
+# The audit directory used to be chosen by $XDG_STATE_HOME. That variable is
+# ambient: a desktop session, a systemd user unit or a container image sets it
+# for reasons that have nothing to do with this program, and whatever launches
+# Firebreak inherits it. A caller that can move the audit directory can make a
+# session unrecorded, and with an ambient variable nobody has to have DECIDED
+# that for it to happen. The canonical location now comes from the passwd
+# entry, which this process cannot rewrite.
+#
+# One purpose-named variable still relocates it, because the test suite and a
+# desktop session with an isolated state tree need some way to say so, and
+# nothing sets this name by accident: a relocation is therefore always
+# deliberate, and every record written under one says it was relocated. That
+# makes relocation VISIBLE, not impossible -- anything running as this uid can
+# set the variable, and can equally unlink the file afterwards. Only a copy
+# that leaves this uid's trust domain closes that, which is the journald
+# mirror in ADR-0010.
+STATE_ENV = "SHADOWFETCH_FIREBREAK_STATE"
+
+
+def passwd_home():
+    """This user's home from the passwd database, never from $HOME."""
+    try:
+        entry = pwd.getpwuid(os.geteuid())
+    except KeyError as exc:
+        raise Error("This user has no passwd entry, so the audit directory cannot be resolved") from exc
+    home = (entry.pw_dir or "").strip()
+    if not home.startswith("/"):
+        raise Error("The passwd entry gives no absolute home directory, so the audit directory cannot be resolved")
+    return Path(home)
+
+
+def state():
+    override = os.environ.get(STATE_ENV, "").strip()
+    if override:
+        path = Path(override).expanduser()
+        if not path.is_absolute():
+            raise Error(STATE_ENV + " must name an absolute directory")
+    else:
+        path = passwd_home() / ".local/state/shadowfetch/firebreak"
+    path = path.resolve()
+    if path == root() or root() in path.parents:
+        raise Error("Audit state must be outside the workspace root")
+    path.mkdir(parents=True, mode=0o700, exist_ok=True)
+    # Somebody else's directory is not ours to write session records into,
+    # whoever pointed us at it.
+    if path.stat().st_uid != os.geteuid():
+        raise Error("The audit directory belongs to another user; session records were not written")
+    path.chmod(0o700)
+    return path
+
+
+def state_relocated():
+    """Whether records are going somewhere other than the canonical directory."""
+    return bool(os.environ.get(STATE_ENV, "").strip())
+
+# 5.0 retired Fire/Ice; an upgraded Ice setting must keep meaning offline.
+LEGACY_ELEMENT_NETWORK = {"ice": "offline", "fire": "online"}
+SYSTEM_CONFIG = Path("/etc/shadowfetch")
+
+
+def agent_network():
+    """online or offline: the default network posture of an agent sandbox.
+
+    Env beats the user file beats the system file. At each level the 5.0
+    agent-network setting wins over the legacy element one.
+    """
+    value = os.environ.get("SHADOWFETCH_AGENT_NETWORK", "").strip().lower()
+    if value in ("online", "offline"):
+        return value
+    value = os.environ.get("SHADOWFETCH_ELEMENT", "").strip().lower()
+    if value in LEGACY_ELEMENT_NETWORK:
+        return LEGACY_ELEMENT_NETWORK[value]
+    config = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "shadowfetch"
+    for directory in (config, SYSTEM_CONFIG):
+        for name, table in (("agent-network", None), ("element", LEGACY_ELEMENT_NETWORK)):
+            try:
+                with open(directory / name, encoding="utf-8") as handle:
+                    value = handle.readline().strip().lower()
+            except OSError:
+                continue
+            if table is None and value in ("online", "offline"):
+                return value
+            if table is not None and value in table:
+                return table[value]
+    return "online"
+
+def workspace(name):
+    base = root()
+    if name:
+        if Path(name).name != name or name.startswith(".") or "\\" in name or len(name) > 160 or any(ord(char) < 32 or ord(char) == 127 for char in name):
+            raise Error("Workspace must be a direct non-hidden folder name")
+        candidate = base / name
+    else:
+        current = Path.cwd().resolve()
+        try:
+            rel = current.relative_to(base)
+            candidate = base / rel.parts[0]
+        except (ValueError, IndexError):
+            raise Error("Choose --workspace NAME under " + str(base))
+    if candidate.is_symlink() or candidate.resolve().parent != base or not candidate.is_dir():
+        raise Error("Workspace is missing or escapes the configured root")
+    return candidate.resolve()
+
+def checkpoint_bin():
+    override = os.environ.get("SHADOWFETCH_CHECKPOINT_BIN")
+    if override:
+        return override
+    return (trusted_which("shadowfetch-checkpoint")
+            or str(Path(__file__).with_name("shadowfetch-checkpoint")))
+
+def read_grants(values, ws):
+    grants = []
+    reserved = (Path("/proc"), Path("/dev"), Path("/run"), Path("/sys"), Path("/home/agent"), state(), root() / ".sf-checkpoints")
+    for value in values:
+        candidate = Path(value).expanduser()
+        resolved = candidate.resolve()
+        if not candidate.is_absolute() or not resolved.exists():
+            raise Error("Read grants must name an existing absolute path")
+        if len(resolved.parts) < 3:
+            raise Error("Read grants cannot expose a filesystem root or top-level directory")
+        if resolved == ws or resolved in ws.parents or ws in resolved.parents:
+            raise Error("Read grant overlaps the writable workspace")
+        if any(resolved == item or resolved in item.parents or item in resolved.parents for item in reserved):
+            raise Error("Read grant overlaps protected sandbox/controller storage")
+        if resolved == Path.home().resolve():
+            raise Error("Grant selected files or a specific runtime folder, never the whole home directory")
+        if not (resolved.is_file() or resolved.is_dir()):
+            raise Error("Read grants support regular files and directories only")
+        grants.append(resolved)
+    return grants
+
+# A session id becomes a systemd unit name (--unit=), a filename, and an
+# environment variable inside the sandbox. All three are injection surfaces, so
+# the shape is checked rather than trusted: the orchestrator is not hostile, but
+# "the caller is trusted" is the assumption this codebase keeps finding was
+# wrong somewhere else.
+SESSION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+def session_id(supplied):
+    """The orchestrator's id if it gave one, otherwise mint our own.
+
+    Mission Control mints the id BEFORE execution so that a crash between
+    launching and recording still leaves a correlatable identity. When it does,
+    Firebreak adopts it: one identity, not two that have to be joined later.
+    """
+    if supplied is None or supplied == "":
+        return ("fb-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+                + "-" + uuid.uuid4().hex[:8])
+    if not SESSION_ID.match(supplied):
+        raise Error(
+            "A session id must be 1-64 characters of letters, digits, hyphen or "
+            "underscore, starting with a letter or digit. It names a systemd "
+            "unit and a file, so its shape is not negotiable.")
+    return supplied
+
+
+# --------------------------------------------------------------------------- #
+# Session records
+# --------------------------------------------------------------------------- #
+# One append-only JSON-lines file per session: a "started" record before the
+# sandbox runs and an "ended" record when it stops. The previous version wrote
+# a single object and REWROTE it at exit, so a running session could not be
+# inspected at all, and a crash between the two writes left neither the start
+# nor the end. Appending keeps the start whatever happens next, and a session
+# with no "ended" record is itself the evidence that it did not finish.
+RECORD_SCHEMA = 2
+
+# The PATH the sandbox is given. Named once because the record claims to
+# resolve the agent's program the way the sandbox will, and a second copy of
+# this string would quietly make that claim false.
+# Only root-owned directories. Firebreak's own readiness output is a security
+# claim, and the checkpoint binary it invokes takes the snapshot that Undo later
+# restores from -- neither may be chosen by whoever set PATH.
+TRUSTED_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+
+def trusted_which(name):
+    """Resolve from trusted directories only. Never PATH."""
+    return shutil.which(name, path=TRUSTED_PATH)
+
+
+SANDBOX_PATH = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+ENFORCED = "enforced"
+PARTIAL = "partial"
+NOT_ENFORCED = "not_enforced"
+OBSERVED = "observed"
+NOT_APPLICABLE = "not_applicable"
+
+
+def append_record(path, record):
+    """Add one line. O_APPEND, so a second writer cannot land on top of it."""
+    line = json.dumps(record, sort_keys=True) + "\n"
+    handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(handle, line.encode())
+        # A record exists to survive the crash that ended the session it
+        # describes, so it reaches the disk before that session starts.
+        os.fsync(handle)
+    finally:
+        os.close(handle)
+    os.chmod(path, 0o600)
+
+
+def read_records(path):
+    """Every record in one session file, including an unreadable tail.
+
+    A truncated final line is what a crash mid-append looks like. It is
+    reported rather than dropped: a reader that silently discards the evidence
+    of a crash is worse than no reader.
+    """
+    text = path.read_text(errors="replace")
+    try:
+        legacy = json.loads(text)
+    except ValueError:
+        pass
+    else:
+        # Sessions recorded before this file became append-only are one
+        # pretty-printed object; read them rather than reporting every line of
+        # them as damage.
+        if isinstance(legacy, dict):
+            legacy.setdefault("record", "legacy")
+            return [legacy]
+    found = []
+    for number, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            found.append(json.loads(line))
+        except ValueError:
+            found.append({"record": "unreadable", "session": path.stem,
+                          "line": number, "characters": len(line)})
+    return found
+
+
+# Option names that are followed by a secret. An agent command is supplied by
+# the caller, so this cannot be exhaustive -- it is a floor, and the value-based
+# strike below is what catches the rest.
+SECRET_OPTIONS = ("--api-key", "--apikey", "--token", "--password", "--secret",
+                  "--auth", "--bearer", "--credential", "--key")
+
+
+def redacted_argv(argv, *, values=()):
+    """The argv with credential VALUES struck out.
+
+    Three passes, because each catches what the others cannot:
+
+    1. POSITION after `--setenv NAME` for a known credential identity. This is
+       how Firebreak itself injects a value, and it is exact.
+    2. POSITION after an option whose NAME says a secret follows. An agent
+       command is caller-supplied, so this list is a floor rather than a
+       guarantee.
+    3. VALUE. Any token equal to a credential value we actually resolved is
+       struck wherever it appears, including `--api-key=VALUE` and bare
+       positional forms.
+
+    Only then the text redactor, which recognises shapes like sk-... but cannot
+    recognise a short or arbitrary value -- and this record outlives the
+    process, so "probably not a secret" is not good enough.
+    """
+    parts = [str(item) for item in argv]
+    for index in range(len(parts) - 2):
+        if parts[index] == "--setenv" and parts[index + 1] in CREDENTIALS:
+            parts[index + 2] = "[REDACTED]"
+    for index in range(len(parts) - 1):
+        if parts[index].lower() in SECRET_OPTIONS:
+            parts[index + 1] = "[REDACTED]"
+    secrets = [str(v) for v in values if v and len(str(v)) >= 4]
+    if secrets:
+        cleaned = []
+        for part in parts:
+            for secret in secrets:
+                if secret in part:
+                    part = part.replace(secret, "[REDACTED]")
+            cleaned.append(part)
+        parts = cleaned
+    return [redact(part) for part in parts]
+
+
+def resolved_executable(program, ws):
+    """The file the sandbox will exec, resolved the way the sandbox will.
+
+    Against the sandbox's PATH and its working directory, not this process's:
+    the same directories are bound into the sandbox at the same paths, so the
+    lookup lands on the same file, while the host's PATH and cwd would not.
+    OBSERVED, never enforced -- bwrap performs its own lookup at exec time and
+    Firebreak does not pin argv[0] to this answer.
+    """
+    if not program:
+        return None, "none"
+    if "/" in program:
+        base = Path(program) if program.startswith("/") else ws / program
+        try:
+            candidate = base.resolve()
+        except OSError:
+            return None, "unresolved"
+        return (str(candidate), "literal-path") if candidate.exists() else (None, "unresolved")
+    found = shutil.which(program, path=SANDBOX_PATH)
+    if not found:
+        return None, "unresolved"
+    return str(Path(found).resolve()), "sandbox-path-lookup"
+
+
+def parent_command():
+    """The launching program's name.
+
+    comm, not the parent's command line: that line can carry material with no
+    business in an audit file, and the name answers what this field is for.
+    """
+    try:
+        return (Path("/proc") / str(os.getppid()) / "comm").read_text().strip()
+    except OSError:
+        return None
+
+
+def signal_name(number):
+    try:
+        return signal.Signals(number).name
+    except ValueError:
+        return str(number)
+
+
+# --------------------------------------------------------------------------- #
+# THE SYSCALL FILTER
+# --------------------------------------------------------------------------- #
+#
+# WHY THERE IS ONE AT ALL, WHEN bwrap ALREADY DROPS EVERY CAPABILITY.
+# Because the capability check is one syscall away from being undone, and that
+# was measured in this sandbox rather than assumed. On this kernel, inside a
+# Firebreak sandbox (tools/probes/stage_f_syscalls.py):
+#
+#     mount("none", "/tmp/sf-mnt", "tmpfs", 0, NULL)          blocked:EPERM
+#     unshare(CLONE_NEWUSER|CLONE_NEWNS)                      REACHED:0
+#       ... and then the very same mount                      REACHED:0
+#
+# chroot, pivot_root, fsopen and open_tree come back the same way. unshare of a
+# user namespace needs no privilege whatsoever, and the namespace it creates is
+# owned by the caller, who holds a full capability set inside it. So "the
+# payload has no capabilities" describes the first instant of a session and not
+# the rest of it.
+#
+# A seccomp filter is different in exactly the way that matters here: it is
+# inherited across fork, clone, unshare and execve, it cannot be removed once
+# installed, and it is consulted BEFORE the capability model. It therefore still
+# holds inside a user namespace the payload made for itself, which is precisely
+# where the capability check stops holding.
+#
+# WHAT THIS DOES NOT CLAIM. Most of the rows below were already answered EPERM
+# by the capability check when they were measured, and denying those changes
+# nothing about today's outcome -- they are here because they survive the
+# escalation above, not because they close anything that was open. The table
+# carries the measurement per row so the difference cannot be rounded away by
+# anyone reading this file, including its author. seccomp_reachable() is the
+# subset that was genuinely permitted before this existed; that subset, and only
+# that subset, is what the filter took away.
+
+# Classic-BPF encodings, from the kernel's linux/bpf_common.h. Spelled out
+# rather than imported because there is nothing to import: the whole program is
+# forty-odd instructions and it decides what a sandbox may do.
+BPF_LD_ABS_W = 0x20                  # BPF_LD | BPF_W | BPF_ABS
+BPF_JEQ_K = 0x15                     # BPF_JMP | BPF_JEQ | BPF_K
+BPF_JGE_K = 0x35                     # BPF_JMP | BPF_JGE | BPF_K
+BPF_RET_K = 0x06                     # BPF_RET | BPF_K
+SECCOMP_DATA_NR = 0                  # offsetof(struct seccomp_data, nr)
+SECCOMP_DATA_ARCH = 4                # offsetof(struct seccomp_data, arch)
+AUDIT_ARCH_X86_64 = 0xC000003E
+X32_SYSCALL_BIT = 0x40000000
+SECCOMP_RET_KILL_PROCESS = 0x80000000
+SECCOMP_RET_ERRNO = 0x00050000
+SECCOMP_RET_ALLOW = 0x7FFF0000
+SECCOMP_ERRNO = 1                    # EPERM
+PR_SET_NO_NEW_PRIVS = 38
+SECCOMP_SET_MODE_FILTER = 1
+NR_SECCOMP = 317
+NR_ADJTIMEX = 159
+
+# How each row behaved in a real sandbox BEFORE this filter existed. Not a
+# judgement, a recording:
+#   permitted        the call succeeded
+#   argument-error   the kernel took the call and refused the arguments, so
+#                    permission was never the thing standing in the way
+#   capability-denied  EPERM or EACCES on permission grounds
+# and `nested` is the same call retried after unshare(CLONE_NEWUSER|CLONE_NEWNS),
+# where that was measured; None where it was not.
+PERMITTED = "permitted"
+ARGUMENT_ERROR = "argument-error"
+CAPABILITY_DENIED = "capability-denied"
+
+# x86_64 syscall numbers. There is no lookup here and no libseccomp: a number
+# resolved at run time out of a library found on a search path would let whoever
+# controls that path decide which calls this filter denies, and the invariant
+# this codebase holds to is that nothing which establishes a security fact is
+# allowed to be resolved that way.
+SECCOMP_DENY = (
+    # -- filesystem and mount namespace. All EPERM on the first attempt and all
+    # reachable one unshare later, which is the measurement that makes this
+    # group load-bearing rather than decorative.
+    ("mount", 165, CAPABILITY_DENIED, PERMITTED),
+    ("umount2", 166, ARGUMENT_ERROR, None),
+    ("pivot_root", 155, ARGUMENT_ERROR, PERMITTED),
+    ("chroot", 161, CAPABILITY_DENIED, PERMITTED),
+    ("open_tree", 428, CAPABILITY_DENIED, PERMITTED),
+    ("move_mount", 429, CAPABILITY_DENIED, None),
+    ("fsopen", 430, CAPABILITY_DENIED, PERMITTED),
+    ("fsconfig", 431, ARGUMENT_ERROR, None),
+    ("fsmount", 432, CAPABILITY_DENIED, None),
+    ("fspick", 433, CAPABILITY_DENIED, None),
+    ("mount_setattr", 442, ARGUMENT_ERROR, None),
+    ("setns", 308, ARGUMENT_ERROR, ARGUMENT_ERROR),
+    # -- io_uring. THE ONE GROUP WITHOUT WHICH THE REST OF THIS TABLE IS
+    # ADVISORY, and that is measured rather than asserted. A ring performs
+    # opens, reads, writes and connects as queue entries, and a queue entry is
+    # not a syscall, so a seccomp filter never sees it.
+    # tools/probes/stage_f_io_uring_bypass.py installs a filter denying open,
+    # openat and openat2 and nothing else, on this kernel:
+    #
+    #     open_after_filter            blocked:EPERM
+    #     io_uring_openat_after_filter REACHED:fd5
+    #     contents_read_through_it     "<hostname>"    (/etc/hostname, read out)
+    #
+    # io_uring_setup was REACHED:3 inside a Firebreak sandbox before Stage F, so
+    # that route was open here. With these three rows denied the same probe stops
+    # at "blocked-at-setup:EPERM" and never reaches a ring at all. Every other row
+    # in this table would be decoration without them.
+    ("io_uring_setup", 425, PERMITTED, None),
+    ("io_uring_enter", 426, ARGUMENT_ERROR, None),
+    ("io_uring_register", 427, ARGUMENT_ERROR, None),
+    # -- other processes' memory and execution. All succeeded when measured.
+    ("ptrace", 101, PERMITTED, None),
+    ("process_vm_readv", 310, PERMITTED, None),
+    ("process_vm_writev", 311, PERMITTED, None),
+    ("kcmp", 312, PERMITTED, None),
+    # -- the kernel keyring, which user namespaces do not namespace: a key added
+    # here is added to a keyring the host shares. All three succeeded.
+    ("add_key", 248, PERMITTED, None),
+    ("request_key", 249, PERMITTED, None),
+    ("keyctl", 250, PERMITTED, None),
+    # -- the clock. The setters were already EPERM (CAP_SYS_TIME is checked in
+    # the INITIAL user namespace, so the unshare above does not recover them);
+    # adjtimex and clock_adjtime succeeded, because their read path needs no
+    # privilege. Denying the pair costs a read nothing in an agent workload
+    # performs and removes the setter path unconditionally.
+    ("settimeofday", 164, CAPABILITY_DENIED, None),
+    ("clock_settime", 227, CAPABILITY_DENIED, None),
+    ("adjtimex", 159, PERMITTED, None),
+    ("clock_adjtime", 305, PERMITTED, None),
+    # -- opening a file by handle, which walks past every path-based control in
+    # this sandbox, including --mask-path. name_to_handle_at succeeded.
+    ("name_to_handle_at", 303, PERMITTED, None),
+    ("open_by_handle_at", 304, ARGUMENT_ERROR, None),
+    # -- kernel code and machine state. Every one of these was already EPERM,
+    # and none of them came back after the unshare that recovers mount; they are
+    # here for the same reason a locked door stays locked when the wall is
+    # sound, and the table says plainly that they closed nothing new.
+    ("init_module", 175, CAPABILITY_DENIED, None),
+    ("finit_module", 313, CAPABILITY_DENIED, None),
+    ("delete_module", 176, CAPABILITY_DENIED, None),
+    ("kexec_load", 246, CAPABILITY_DENIED, None),
+    ("kexec_file_load", 320, CAPABILITY_DENIED, None),
+    ("reboot", 169, CAPABILITY_DENIED, None),
+    ("swapon", 167, CAPABILITY_DENIED, None),
+    ("swapoff", 168, CAPABILITY_DENIED, None),
+    ("iopl", 172, CAPABILITY_DENIED, None),
+    ("ioperm", 173, CAPABILITY_DENIED, None),
+    ("acct", 163, CAPABILITY_DENIED, None),
+    ("quotactl", 179, ARGUMENT_ERROR, None),
+    ("vhangup", 153, CAPABILITY_DENIED, None),
+    ("syslog", 103, CAPABILITY_DENIED, None),
+    ("perf_event_open", 298, CAPABILITY_DENIED, None),
+    ("fanotify_init", 300, CAPABILITY_DENIED, None),
+    ("bpf", 321, CAPABILITY_DENIED, CAPABILITY_DENIED),
+    ("userfaultfd", 323, CAPABILITY_DENIED, CAPABILITY_DENIED),
 )
 
-say()  { printf '\033[1;33m==>\033[0m %s\n' "$*"; }
-ok()   { printf '\033[1;32m OK\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;31m !!\033[0m %s\n' "$*" >&2; }
-die()  { warn "$*"; exit 1; }
+# WHY SECCOMP AND NOT LANDLOCK. Both were measured. This kernel offers
+# Landlock ABI 9 (landlock_create_ruleset(NULL, 0, VERSION) returns 9, on the
+# host and inside a sandbox alike), but bubblewrap 0.11.0 -- the version this
+# package runs and the one Pop!_OS 24.04 ships -- has no Landlock support
+# whatsoever: no option mentions it and the string does not occur in the binary.
+# A ruleset would therefore have to be installed by Firebreak BEFORE bwrap, where
+# it is inherited across execve and would forbid bwrap its own bind mounts, or by
+# a shim between bwrap and the payload, which is a real design and is not this
+# one. What Landlock can express is filesystem paths and TCP ports; in this
+# sandbox those are already the mount namespace's job and the egress filter's,
+# and neither of them can express a syscall. So the unenforced field gets the
+# mechanism that fits it.
+#
+# uselib is deliberately NOT in that table. It answered ENOSYS: this kernel does
+# not implement it, so denying it would have been a row that reads like a
+# control and removes nothing at all. Neither is unshare, nor clone: denying
+# those would stop a payload sandboxing ITSELF -- glibc starts threads with
+# clone3 and node and chrome build their own namespaces -- and the filter does
+# not need to, because it is inherited into whatever namespace the payload makes
+# and the operations that namespace would be FOR are denied above.
 
-usage() {
-  cat <<'EOF'
-shadowfetch-firebreak - run a coding agent full-auto, safely contained.
 
-USAGE
-  shadowfetch-firebreak run [OPTIONS] -- <command> [args...]
-  shadowfetch-firebreak check
-  shadowfetch-firebreak log [N]
-  shadowfetch-firebreak --version
+class SeccompUnavailable(Error):
+    """The kernel would not take the filter, so no sandbox is started."""
 
-RUN OPTIONS
-  --workspace NAME   workspace under ~/Workspaces to expose writable
-                     (default: the current directory if it is inside a
-                     workspace, else required)
-  --net none|allow   cut the sandbox off the network, or allow it
-                     (default: the element's — fire=allow, ice=none;
-                     see shadowfetch-element)
-  --no-checkpoint    do not take a pre-run workspace checkpoint (not advised)
-  --keep-secrets     do NOT scrub credential variables (not advised)
-  --                 everything after this is the agent command to run
 
-EXAMPLES
-  shadowfetch-firebreak run --workspace api --net none -- claude --dangerously-skip-permissions
-  shadowfetch-firebreak run -- codex exec "refactor the parser"
+def seccomp_reachable():
+    """The denied calls this sandbox actually permitted before the filter.
 
-The system is read-only inside; only the workspace is writable. Undo the whole
-session with:  shadowfetch-checkpoint undo <workspace> <checkpoint-id>
-EOF
-}
+    The honest size of what was taken away. A row that was already EPERM on
+    permission grounds, and stayed EPERM after the escalation, is not in here.
+    """
+    return tuple(row[0] for row in SECCOMP_DENY
+                 if row[2] in (PERMITTED, ARGUMENT_ERROR) or row[3] == PERMITTED)
 
-cmd_check() {
-  local fail=0
-  if command -v bwrap >/dev/null; then ok "bubblewrap present ($(bwrap --version))"; else warn "bubblewrap (bwrap) missing"; fail=1; fi
-  if [ "$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo 1)" = "1" ]; then
-    ok "unprivileged user namespaces enabled"
-  else warn "unprivileged user namespaces disabled (sysctl kernel.unprivileged_userns_clone=1 needed)"; fail=1; fi
-  if [ -e /sys/kernel/security/landlock/version ] 2>/dev/null || grep -q landlock /proc/self/status 2>/dev/null; then
-    ok "Landlock LSM available"; else say "Landlock not detected (bubblewrap scoping still applies)"; fi
-  if command -v "$CHECKPOINT_BIN" >/dev/null; then ok "checkpoint engine present"; else warn "shadowfetch-checkpoint missing (no pre-run snapshots)"; fail=1; fi
-  [ "$fail" = 0 ] && { ok "Firebreak is ready."; return 0; } || { warn "Firebreak preconditions not met."; return 1; }
-}
 
-cmd_log() {
-  local n="${1:-10}"
-  [ -d "$STATE_DIR" ] || { say "no Firebreak sessions yet."; return 0; }
-  ls -1t "$STATE_DIR"/*.session 2>/dev/null | head -n "$n" | while read -r f; do
-    printf '%s\n' "$(cat "$f")"
-  done
-}
+def seccomp_program():
+    """The classic-BPF program bwrap is handed, assembled here in this file.
 
-resolve_workspace() {
-  local name="$1"
-  if [ -n "$name" ]; then printf '%s' "$WS_ROOT/$name"; return; fi
-  # infer from CWD if it is inside a workspace
-  local cwd; cwd="$(pwd -P)"
-  case "$cwd" in
-    "$WS_ROOT"/*)
-      local rel="${cwd#"$WS_ROOT"/}"; printf '%s' "$WS_ROOT/${rel%%/*}" ;;
-    *) return 1 ;;
-  esac
-}
+    Layout, so the jump offsets are counted rather than guessed:
 
-cmd_run() {
-  local el; el="$(element)"
-  local net_default="allow"; [ "$el" = "ice" ] && net_default="none"
-  local ws_name="" net="$net_default" do_ckpt=1 scrub=1
-  local -a agent_cmd=()
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --workspace) ws_name="${2:?}"; shift 2 ;;
-      --net) net="${2:?}"; shift 2 ;;
-      --no-checkpoint) do_ckpt=0; shift ;;
-      --keep-secrets) scrub=0; shift ;;
-      --) shift; agent_cmd=("$@"); break ;;
-      *) die "unknown run option: $1 (use -- before the agent command)" ;;
-    esac
-  done
-  [ "${#agent_cmd[@]}" -gt 0 ] || die "no agent command given (put it after --)"
-  command -v bwrap >/dev/null || die "bubblewrap (bwrap) is not installed"
+        0   load seccomp_data.arch
+        1   arch == x86_64 ? skip the kill : fall into it
+        2   kill the process
+        3   load seccomp_data.nr
+        4   nr >= X32_SYSCALL_BIT ? deny : continue
+        5.. one equality test per denied number, each jumping to deny
+        n   allow
+        n+1 deny with EPERM
 
-  local ws; ws="$(resolve_workspace "$ws_name")" \
-    || die "not inside ~/Workspaces and no --workspace given"
-  ws="$(cd "$ws" 2>/dev/null && pwd -P)" || die "workspace does not exist: $WS_ROOT/${ws_name:-?}"
-  case "$ws" in "$WS_ROOT"/*) : ;; *) die "workspace must live under $WS_ROOT" ;; esac
-  local ws_basename="${ws#"$WS_ROOT"/}"; ws_basename="${ws_basename%%/*}"
+    The architecture test on line 1 is not a formality. seccomp matches on
+    syscall NUMBERS, and the same number means a different call in another
+    personality -- 165 is mount on x86_64 and getpgrp on i386 -- so a filter
+    that let a foreign personality through would deny nothing to a task that
+    simply asked in a different dialect. This one kills instead, which is what
+    systemd's SystemCallArchitectures=native does and for the same reason. The
+    cost is stated rather than hidden: a 32-bit payload dies with SIGSYS under
+    Firebreak, and this box does have an i386 runtime installed.
 
-  mkdir -p "$STATE_DIR"
-  local sid; sid="fb-$(date +%Y%m%d-%H%M%S)-$$"
-  local ckpt_id="none"
+    x32 shares AUDIT_ARCH_X86_64 and renumbers every call above 0x40000000, so
+    it is refused on line 4 rather than mapped.
+    """
+    numbers = sorted({number for _, number, _, _ in SECCOMP_DENY})
+    deny_index = 5 + len(numbers) + 1
+    instructions = [
+        (BPF_LD_ABS_W, 0, 0, SECCOMP_DATA_ARCH),
+        (BPF_JEQ_K, 1, 0, AUDIT_ARCH_X86_64),
+        (BPF_RET_K, 0, 0, SECCOMP_RET_KILL_PROCESS),
+        (BPF_LD_ABS_W, 0, 0, SECCOMP_DATA_NR),
+        (BPF_JGE_K, deny_index - 5, 0, X32_SYSCALL_BIT),
+    ]
+    for offset, number in enumerate(numbers):
+        instructions.append((BPF_JEQ_K, deny_index - (5 + offset + 1), 0, number))
+    instructions.append((BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW))
+    instructions.append((BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO | SECCOMP_ERRNO))
+    # A jump offset is a single byte. Past 250 or so denied numbers this layout
+    # silently wraps and the filter starts allowing what it lists, so it refuses
+    # to assemble instead. The table would have to roughly quintuple to get here.
+    for code, jt, jf, k in instructions:
+        if not 0 <= jt <= 255 or not 0 <= jf <= 255:
+            raise SeccompUnavailable(
+                "the deny list outgrew a single-byte BPF jump; the program would "
+                "silently allow what it lists and is not assembled")
+    return b"".join(struct.pack("=HBBI", *one) for one in instructions)
 
-  say "Firebreak session $sid"
-  say "workspace : $ws"
-  say "element   : $el ($([ "$el" = ice ] && echo run-cold || echo run-hot))"
-  say "network   : $net$([ "$net" = "$net_default" ] && echo " (element default)")"
-  say "secrets   : $([ "$scrub" = 1 ] && echo scrubbed || echo PASSED-THROUGH)"
 
-  if [ "$do_ckpt" = 1 ] && command -v "$CHECKPOINT_BIN" >/dev/null; then
-    local out; out="$("$CHECKPOINT_BIN" snapshot "$ws_basename" --label "firebreak:$sid" 2>&1)" \
-      && ckpt_id="$(printf '%s' "$out" | grep -oE 'checkpoint [0-9-]+' | awk '{print $2}')" \
-      && ok "checkpoint $ckpt_id taken (undo: shadowfetch-checkpoint undo $ws_basename $ckpt_id)" \
-      || warn "checkpoint failed: $out"
-  fi
+def seccomp_digest():
+    """sha256 of the exact bytes, so a record names a program and not a promise."""
+    return hashlib.sha256(seccomp_program()).hexdigest()
 
-  # audit: session start
-  local start_ts; start_ts="$(date -Is)"
-  command -v logger >/dev/null && logger -t shadowfetch-firebreak \
-    "session=$sid start ws=$ws_basename net=$net scrub=$scrub checkpoint=$ckpt_id cmd=${agent_cmd[*]}"
 
-  # build bubblewrap argv
-  local -a bw=(
-    bwrap
-    --ro-bind / /
-    --dev /dev
-    --proc /proc
-    --tmpfs /tmp
-    --tmpfs /run
-    --bind "$ws" "$ws"
-    --die-with-parent
-    --unshare-pid
-    --unshare-uts
-    --unshare-ipc
-    --hostname firebreak
-    --new-session
-    --chdir "$ws"
-    --setenv SHADOWFETCH_FIREBREAK "$sid"
-    --setenv SHADOWFETCH_FIREBREAK_WORKSPACE "$ws_basename"
-    --setenv PS1 "(firebreak) \\w \\$ "
-  )
-  [ "$net" = "none" ] && bw+=( --unshare-net )
-  if [ "$scrub" = 1 ]; then
-    local v; for v in "${SCRUB_VARS[@]}"; do bw+=( --unsetenv "$v" ); done
-  fi
+def seccomp_selftest():
+    """Install the program in a throwaway child and MEASURE what it does there.
 
-  "${bw[@]}" -- "${agent_cmd[@]}"
-  local rc=$?
+    Not a kernel version check and not a feature sniff. The real program is
+    loaded, then a call the table denies is made under it and its errno read,
+    and then a call the table does not deny is made through the same filter --
+    because a filter that denies everything is a broken sandbox, not a secure
+    one, and this is the cheapest place to find that out.
 
-  # audit: session end + manifest
-  local end_ts; end_ts="$(date -Is)"
-  cat > "$STATE_DIR/$sid.session" <<EOM
-session:    $sid
-workspace:  $ws_basename ($ws)
-command:    ${agent_cmd[*]}
-network:    $net
-secrets:    $([ "$scrub" = 1 ] && echo scrubbed || echo passed-through)
-checkpoint: $ckpt_id
-started:    $start_ts
-ended:      $end_ts
-exit:       $rc
-undo:       shadowfetch-checkpoint undo $ws_basename $ckpt_id
-EOM
-  command -v logger >/dev/null && logger -t shadowfetch-firebreak \
-    "session=$sid end exit=$rc checkpoint=$ckpt_id"
+    It runs before every launch for the same reason the egress filter resolves
+    its allowlist before every launch: the alternative is a session that runs
+    with none of this applied while its record describes a profile.
 
-  say "session $sid ended (exit $rc)"
-  [ "$ckpt_id" != "none" ] && say "undo everything: shadowfetch-checkpoint undo $ws_basename $ckpt_id"
-  return $rc
-}
+    The child speaks to the kernel through libc's syscall(2) in the C library
+    ALREADY MAPPED into this process. There is no helper program to locate, so
+    there is no search path with which somebody else could decide the answer.
+    """
+    global _SECCOMP_VERIFIED
+    if _SECCOMP_VERIFIED:
+        return _SECCOMP_VERIFIED
+    program = seccomp_program()
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.syscall.restype = ctypes.c_long
+    libc.prctl.restype = ctypes.c_int
+    blob = ctypes.create_string_buffer(program, len(program))
 
-case "${1:-}" in
-  -h|--help|"") usage ;;
-  --version) echo "shadowfetch-firebreak (Shadowfetch Linux) $VERSION" ;;
-  check) shift; cmd_check "$@" ;;
-  log)   shift; cmd_log "$@" ;;
-  run)   shift; cmd_run "$@" ;;
-  *) die "unknown command: $1 (try --help)" ;;
-esac
+    class SockFprog(ctypes.Structure):
+        _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.c_void_p)]
+
+    fprog = SockFprog(len(program) // 8, ctypes.cast(blob, ctypes.c_void_p))
+    scratch = ctypes.create_string_buffer(208)
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+                os._exit(11)
+            if libc.syscall(ctypes.c_long(NR_SECCOMP),
+                            ctypes.c_long(SECCOMP_SET_MODE_FILTER),
+                            ctypes.c_long(0), ctypes.byref(fprog)) != 0:
+                os._exit(12)
+            # adjtimex, because it answered REACHED:0 in this sandbox before the
+            # filter existed. An EPERM here cannot have come from anywhere else.
+            ctypes.set_errno(0)
+            if libc.syscall(ctypes.c_long(NR_ADJTIMEX), ctypes.byref(scratch)) != -1:
+                os._exit(13)
+            if ctypes.get_errno() != SECCOMP_ERRNO:
+                os._exit(14)
+            # write(2) is not in the table, and this is the proof of it: the
+            # message only arrives if a permitted call still works under the
+            # filter that just denied one.
+            os.write(write_fd, b"denied-EPERM permitted-write")
+            os._exit(0)
+        except BaseException:
+            os._exit(15)
+    os.close(write_fd)
+    with os.fdopen(read_fd, "rb") as handle:
+        proof = handle.read()
+    _, status = os.waitpid(pid, 0)
+    if os.WIFSIGNALED(status):
+        raise SeccompUnavailable(
+            "the kernel killed the process that loaded the syscall filter with "
+            "signal %d; no sandbox is started without the filter it reports"
+            % os.WTERMSIG(status))
+    code = os.WEXITSTATUS(status)
+    if code or proof != b"denied-EPERM permitted-write":
+        raise SeccompUnavailable(
+            {11: "this kernel refused PR_SET_NO_NEW_PRIVS",
+             12: "this kernel refused SECCOMP_SET_MODE_FILTER for the assembled program",
+             13: "the filter loaded and did not deny a call it lists",
+             14: "the filter loaded and denied with the wrong errno",
+             15: "the filter could not be loaded at all"}.get(
+                 code, "the syscall-filter self-test failed (exit %d)" % code)
+            + ". The sandbox is refused rather than started unfiltered")
+    # The child's own words, carried out rather than paraphrased: what `check`
+    # prints and what the test asserts on is the message that only exists
+    # because a denied call returned EPERM and a permitted one still ran.
+    _SECCOMP_VERIFIED = "seccomp-bpf self-test: " + proof.decode()
+    return _SECCOMP_VERIFIED
+
+
+_SECCOMP_VERIFIED = None
+
+
+def seccomp_filter_fd():
+    """A sealed descriptor holding the program, at offset 0, ready to inherit.
+
+    bwrap takes the filter as a DESCRIPTOR rather than a path, and that is the
+    artefact that decides what the sandbox runs under -- so this is what
+    enforcement() reads back, not the flag next to it. memfd rather than a file
+    because a path is a place somebody else can rewrite between our write and
+    bwrap's read; the seals then close the same window against this process
+    itself, so the bytes enforcement() verifies are provably the bytes bwrap
+    loads.
+    """
+    seccomp_selftest()
+    program = seccomp_program()
+    # EVERY WAY THIS CAN FAIL HAS TO ARRIVE AS SeccompUnavailable. It is the one
+    # exception _run() catches to write a refusal record, and the first version
+    # of this let an OSError from the sealing call, or an AttributeError on a
+    # runtime without memfd_create, past it -- so the run still stopped, which is
+    # right, but stopped with a bare traceback and left the audit directory
+    # looking as though nobody had asked. A refusal that is not recorded is the
+    # failure this file already fixed once for the egress filter.
+    try:
+        fd = os.memfd_create("shadowfetch-firebreak-seccomp", 0x0002)   # MFD_ALLOW_SEALING, no CLOEXEC
+    except (OSError, AttributeError) as exc:
+        raise SeccompUnavailable(
+            "no anonymous descriptor could be created to carry the syscall "
+            "filter: " + redact(exc)) from exc
+    try:
+        if os.write(fd, program) != len(program):
+            raise SeccompUnavailable("the syscall filter could not be written whole")
+        os.lseek(fd, 0, os.SEEK_SET)
+        # F_ADD_SEALS with WRITE|SHRINK|GROW|SEAL. After this the contents cannot
+        # change and the seal cannot be lifted, by us or by anybody else holding
+        # the descriptor.
+        fcntl.fcntl(fd, 1033, 0x0001 | 0x0002 | 0x0004 | 0x0008)
+        os.set_inheritable(fd, True)
+    except SeccompUnavailable:
+        os.close(fd)
+        raise
+    except OSError as exc:
+        os.close(fd)
+        raise SeccompUnavailable(
+            "the syscall filter could not be sealed into a descriptor bwrap can "
+            "read: " + redact(exc)) from exc
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def seccomp_fd_in(argv):
+    """The descriptor number this argv hands bwrap, read out of the argv."""
+    for index in range(len(argv) - 1):
+        if argv[index] == "--seccomp":
+            try:
+                return int(argv[index + 1])
+            except ValueError:
+                return None
+    return None
+
+
+def seccomp_status(argv):
+    """What the argv about to be spawned really applies, for the record.
+
+    The flag alone would prove only that a number was passed. bwrap reads the
+    program out of that descriptor, so the descriptor is held to the program
+    this build assembles -- read back with pread, which does not disturb the
+    offset bwrap will read from, and compared byte for byte. A descriptor
+    carrying something else, or none at all, is reported as not enforced rather
+    than described by the request that asked for it.
+    """
+    fd = seccomp_fd_in(argv)
+    if fd is None:
+        return {"status": NOT_ENFORCED,
+                "mechanism": "the argv about to be spawned hands bwrap no seccomp program"}
+    program = seccomp_program()
+    try:
+        loaded = os.pread(fd, len(program) + 1, 0)
+    except OSError as exc:
+        return {"status": NOT_ENFORCED,
+                "mechanism": "the descriptor this argv names cannot be read back: "
+                             + redact(exc)}
+    if loaded != program:
+        return {"status": NOT_ENFORCED,
+                "mechanism": "the descriptor this argv names does not hold the "
+                             "syscall profile this build assembles"}
+    reachable = seccomp_reachable()
+    return {"status": ENFORCED,
+            "mechanism":
+                "a seccomp-BPF program on the descriptor in this argv, loaded by "
+                "bwrap and applied by the kernel to the sandbox's first process "
+                "immediately before execve. %d syscalls answer EPERM, of which %d "
+                "were measurably reachable in this sandbox beforehand (%s); the "
+                "rest were already refused on capability grounds and are denied "
+                "here because a filter SURVIVES what a capability check does not "
+                "-- it is inherited across fork, unshare and execve and cannot be "
+                "removed, so it still holds in a user namespace the payload makes "
+                "for itself, where mount and chroot were measured to come back. "
+                "Filtering is BY SYSCALL NUMBER on x86_64: the x32 numbering is "
+                "refused and any other personality is killed rather than run "
+                "unfiltered. Verified by reading the program back out of that "
+                "descriptor, which is sealed against modification, and matching "
+                "sha256 %s"
+                % (len(SECCOMP_DENY), len(reachable), ", ".join(reachable),
+                   seccomp_digest())}
+
+
+def applied(argv, *tokens):
+    """Whether these tokens appear consecutively in the argv about to be spawned."""
+    width = len(tokens)
+    return any(tuple(argv[index:index + width]) == tokens
+               for index in range(len(argv) - width + 1))
+
+
+def network_namespaced(argv):
+    """Whether this argv creates a network namespace. Two mechanisms count.
+
+    bwrap's own --unshare-net makes one for posture 'none'. Posture 'allow'
+    needs the namespace to exist BEFORE bwrap so the NAT and the egress filter
+    can be installed into the one the sandbox will really run in, so an
+    `unshare --net` helper makes it and bwrap inherits it -- and bwrap must not
+    also be given --unshare-net there, or it would make a second, empty
+    namespace and leave the filtered one behind. Reading only bwrap's flag would
+    report a contained session as an uncontained one.
+    """
+    if applied(argv, "--unshare-net"):
+        return True
+    for index, value in enumerate(argv):
+        if os.path.basename(value) == "unshare" and "--net" in argv[index:]:
+            return True
+    return False
+
+
+def _status(active, mechanism, missing):
+    return {"status": ENFORCED if active else NOT_ENFORCED,
+            "mechanism": mechanism if active else missing}
+
+
+def enforcement(argv, args, ws, grants, credentials, net):
+    """What the argv about to be spawned actually applies, field by field.
+
+    Read out of the BUILT argv rather than echoed back from the request. A
+    record that repeated the request would make a control merely asked for
+    indistinguishable from one the kernel is told to apply -- and two of these
+    fields' mechanisms differ by posture, and saying which one ran is the
+    whole point: an allowlist on an unshared namespace with no NAT is enforced
+    by there being no route at all, which is a different fact from an nftables
+    ruleset that permits three addresses.
+    """
+    egress = list(getattr(args, "egress_host", None) or [])
+    masks = list(getattr(args, "mask_path", None) or [])
+    binding = "--ro-bind" if args.workspace_mode == "read-only" else "--bind"
+    report = {
+        "workspace_mode": _status(
+            applied(argv, binding, str(ws), str(ws)),
+            "bwrap " + binding + " on the workspace",
+            "the workspace is not bound the way " + args.workspace_mode + " asks"),
+        "private_home": _status(
+            applied(argv, "--clearenv") and applied(argv, "--dir", "/home/agent"),
+            "bwrap --clearenv and a private /home/agent in a fresh mount namespace",
+            "the sandbox gets no private home, or an environment that was not cleared"),
+        "cpu_seconds": {
+            "status": PARTIAL,
+            "mechanism": "RLIMIT_CPU set on this process before exec. It is "
+                         "per-process, so a task that forks gets a fresh budget "
+                         "for each child"},
+        "executable_path": {
+            "status": OBSERVED,
+            "mechanism": "the resolved path is what Firebreak's own lookup found. "
+                         "bwrap resolves argv[0] itself at exec time and Firebreak "
+                         "does not pin it"},
+        "egress_allowlist": (
+            {"status": NOT_APPLICABLE, "mechanism": "no egress host was asked for"}
+            if not egress else
+            {"status": ENFORCED,
+             "mechanism": "no route exists: the sandbox has its own network "
+                          "namespace and no NAT was attached to it, so every "
+                          "destination is unreachable, allowlisted or not"}
+            if net != "allow" else
+            {"status": ENFORCED,
+             "mechanism": "an nftables ruleset in the sandbox's own network "
+                          "namespace, default DROP, permitting only the addresses "
+                          "these names resolved to plus the NAT itself. Installed "
+                          "before the sandbox starts, by the process that created "
+                          "the namespace. Filtering is BY ADDRESS: a name is "
+                          "resolved once, on the host, at launch -- an address set "
+                          "that changes afterwards is no longer reachable until "
+                          "the next run"}),
+        "masked_paths": (
+            {"status": NOT_APPLICABLE, "mechanism": "no masked path was asked for"}
+            if not masks else
+            _status(
+                all(applied(argv, "--tmpfs", str(Path(os.path.realpath(m))))
+                    or applied(argv, "--ro-bind", "/dev/null",
+                               str(Path(os.path.realpath(m))))
+                    for m in masks),
+                "bwrap mounts over each masked path in the sandbox's own mount "
+                "namespace: an empty tmpfs over a directory, /dev/null over a "
+                "file. No cooperation from the payload is involved. A HARDLINK "
+                "to the same inode under an unmasked name is still readable -- "
+                "masking is by path",
+                "a declared mask does not appear in the argv about to be spawned")),
+        "memory_mb": _status(
+            applied(argv, "--property=MemoryMax=" + str(args.memory_mb) + "M")
+            and applied(argv, "--property=MemorySwapMax=0"),
+            "systemd MemoryMax with MemorySwapMax=0, so the cap bounds the "
+            "workload rather than the resident set",
+            "the systemd scope does not carry this memory cap"),
+        "processes": _status(
+            applied(argv, "--property=TasksMax=" + str(args.processes)),
+            "systemd TasksMax on the session's own cgroup",
+            "the systemd scope does not carry this task cap"),
+        # Read out of the argv like every other row, and then one step further:
+        # the row resolves the descriptor the argv names and compares the bytes
+        # bwrap will load against the program this build assembles. A flag with
+        # nothing behind it reports not_enforced.
+        "syscall_profile": seccomp_status(argv),
+    }
+    # Both postures now. 'allow' used to create no namespace at all and this
+    # row said so; it reaches the internet through a user-space NAT attached to
+    # its own namespace instead, so the host's loopback and abstract sockets are
+    # out of reach either way.
+    report["network"] = _status(
+        network_namespaced(argv),
+        ("the sandbox gets its own network namespace. "
+         + ("bwrap --unshare-net makes it and posture 'none' leaves it empty"
+            if net == "none" else
+            "Names are resolved through the NAT's own forwarder at "
+            + SLIRP_RESOLVER + ", because the host's resolver is a loopback "
+            "stub that does not exist in this namespace -- so a query name can "
+            "carry data out even where an address cannot. "
+            "`unshare --user --net` makes it before bwrap, which inherits it "
+            "rather than making a second one, so the slirp4netns NAT and the "
+            "egress filter are installed into the namespace the sandbox really "
+            "runs in. --disable-host-loopback keeps the host's loopback "
+            "services and its abstract sockets out of reach")),
+        "a network namespace was not created")
+    report["read_grants"] = (
+        {"status": NOT_APPLICABLE, "mechanism": "no read grant was asked for"}
+        if not grants else
+        _status(all(applied(argv, "--ro-bind", str(grant), str(grant)) for grant in grants),
+                "bwrap --ro-bind per grant",
+                "a grant that was asked for is not bound into the sandbox"))
+    identities = [name for name in credentials if name in CREDENTIALS]
+    report["credentials"] = _status(
+        applied(argv, "--clearenv")
+        and all(any(argv[index] == "--setenv" and argv[index + 1] == name
+                    for index in range(len(argv) - 1))
+                for name in identities),
+        "bwrap --clearenv, then one --setenv per granted identity and nothing else",
+        "the environment is not cleared, or a granted identity did not reach the sandbox")
+    if getattr(args, "codex_account", False):
+        report["account_mount"] = _status(
+            any(argv[index] == "--bind" and argv[index + 2] == "/home/agent/.codex"
+                for index in range(len(argv) - 2)),
+            "bwrap --bind of the dedicated account home",
+            "an account grant was asked for and no account home is bound")
+    return report
+
+
+def effective_network(args):
+    """The posture this run will really have.
+
+    Extracted because the launcher has to know it BEFORE the argv is built: a
+    networked sandbox needs a resolver file that the argv has to bind, and the
+    argv is built here.
+    """
+    return args.net or ("none" if agent_network() == "offline" else "allow")
+
+
+# The NAT's own DNS forwarder. slirp4netns --configure lays out 10.0.2.0/24 with
+# the gateway at .2 and a DNS forwarder at .3, and the egress ruleset accepts
+# that subnet because without it nothing resolves or routes.
+#
+# WHAT THIS BUYS AND WHAT IT COSTS. Without it a networked sandbox could open a
+# socket to an address and could not turn a NAME into one: the host's
+# /etc/resolv.conf points at 127.0.0.53, which inside the sandbox's own network
+# namespace is the sandbox's own empty loopback. Every cloud provider addresses
+# its API by name, so every turn failed at getaddrinfo. What it costs is stated
+# rather than hidden: DNS queries leave through the forwarder, so a payload can
+# encode data in query names and the destination allowlist -- which filters by
+# address -- does not see it. An allowlist narrows where bytes can be SENT; it
+# is not a claim that nothing can be signalled out.
+SLIRP_RESOLVER = "10.0.2.3"
+SLIRP_RESOLV_CONF = ("# Written by Shadowfetch Firebreak for a sandbox that has\n"
+                     "# its own network namespace: the host's resolver is not\n"
+                     "# reachable from inside one.\n"
+                     "nameserver " + SLIRP_RESOLVER + "\n"
+                     "options timeout:2 attempts:2\n")
+
+
+def arguments(args, ws, sid, resolv=None):
+    net = effective_network(args)
+    grants = read_grants(args.read, ws)
+    # --seccomp takes a DESCRIPTOR, so the descriptor is opened here and the
+    # argv this function returns is complete: enforcement() reads the filter
+    # back out of the number that appears in it, and _run() inherits that same
+    # number to the child and closes it afterwards. seccomp_filter_fd() runs the
+    # kernel self-test first, so a kernel that will not take the filter raises
+    # SeccompUnavailable here and no argv is produced at all.
+    command = [trusted_program(BWRAP_PATHS, "bubblewrap"), "--die-with-parent", "--new-session", "--unshare-user", "--unshare-pid", "--unshare-uts", "--unshare-ipc", "--hostname", "firebreak", "--clearenv", "--seccomp", str(seccomp_filter_fd())]
+    for system in ("/usr", "/bin", "/sbin", "/lib", "/lib64"):
+        path = Path(system)
+        if path.is_symlink():
+            command += ["--symlink", os.readlink(path), system]
+        elif path.exists():
+            command += ["--ro-bind", system, system]
+    command += ["--dir", "/etc"]
+    for public in PUBLIC_ETC:
+        # The host's resolver is deliberately NOT carried into a sandbox that
+        # has its own network namespace: it names a loopback stub that only
+        # exists in the host's namespace, so binding it hands the sandbox a
+        # resolver that cannot answer. The caller supplies one that can.
+        if public == "resolv.conf" and resolv is not None:
+            continue
+        source = Path("/etc") / public
+        if source.exists():
+            command += ["--ro-bind", str(source.resolve()), str(source)]
+    if resolv is not None:
+        command += ["--ro-bind", str(resolv), "/etc/resolv.conf"]
+    command += ["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run", "--dir", "/home", "--dir", "/home/agent", "--dir", "/home/agent/.config", "--dir", "/home/agent/.cache", "--dir", "/home/agent/.local", "--dir", "/home/agent/.local/state", "--dir", "/home/agent/.local/share"]
+    for grant in grants:
+        command += ["--ro-bind", str(grant), str(grant)]
+    # A read-only workspace is bound --ro-bind. Until this existed, a
+    # provider declaring "workspace_mode": "read-only" got a fully
+    # writable workspace and the restriction held only because the Codex
+    # adapter volunteered --sandbox read-only in its own argv -- provider
+    # code choosing its own restraint, which is what a sandbox boundary
+    # exists in order not to depend on. /tmp stays a writable tmpfs, so a
+    # read-only task still has scratch space.
+    bind = "--ro-bind" if args.workspace_mode == "read-only" else "--bind"
+    command += [bind, str(ws), str(ws), "--chdir", str(ws)]
+    # Masks go on AFTER the workspace, so they overlay it. A path that resolved
+    # outside the workspace is refused rather than quietly masked: masking
+    # something the sandbox could not see anyway is a claim with no content, and
+    # masking an arbitrary host path on request is a denial-of-service primitive.
+    for masked in mask_targets(args, ws):
+        command += masked
+    
+    # 'none' unshares here and stays empty. 'allow' does NOT: run() has
+    # already created, NAT'd and filtered a namespace, and bwrap INHERITS it --
+    # unsharing again would hand the sandbox a fresh empty one and undo both the
+    # connectivity and the allowlist. Either way the sandbox never has the
+    # host's network, its loopback services or its abstract sockets.
+    if net == "none":
+        command += ["--unshare-net"]
+    environment = {"HOME": "/home/agent", "USER": "agent", "LOGNAME": "agent", "PATH": SANDBOX_PATH, "LANG": "C.UTF-8", "XDG_CONFIG_HOME": "/home/agent/.config", "XDG_CACHE_HOME": "/home/agent/.cache", "XDG_STATE_HOME": "/home/agent/.local/state", "XDG_DATA_HOME": "/home/agent/.local/share", "SHADOWFETCH_FIREBREAK": sid, "SHADOWFETCH_FIREBREAK_WORKSPACE": ws.name, "TMPDIR": "/tmp", "PYTHONDONTWRITEBYTECODE": "1"}
+    if getattr(args, "codex_account", False):
+        if net != "allow":
+            raise Error("A Codex account grant requires explicit cloud network access")
+        locations = [Path("/usr/lib/shadowfetch/missions")]
+        locations += [parent / "packages/shadowfetch-missions/data/usr/lib/shadowfetch/missions" for parent in Path(__file__).resolve().parents]
+        module_dir = next((p for p in locations if (p / "sf_mission_account.py").is_file()), None)
+        if module_dir is None:
+            raise Error("Install Mission Control account support first")
+        sys.path.insert(0, str(module_dir))
+        from sf_mission_account import account_home, AccountError
+        try:
+            dedicated = account_home()
+        except AccountError as exc:
+            raise Error(str(exc)) from exc
+        if not (dedicated / "auth.json").is_file():
+            raise Error("Sign in with shadowfetch-mission-account login first")
+        if dedicated == ws or dedicated in ws.parents or ws in dedicated.parents:
+            raise Error("Mission account storage must not overlap the workspace")
+        command += ["--bind", str(dedicated), "/home/agent/.codex"]
+        environment["CODEX_HOME"] = "/home/agent/.codex"
+    requested = set(args.credential_env)
+    if args.keep_secrets:
+        requested |= {name for name in CREDENTIALS if name in os.environ and name != "SSH_AUTH_SOCK"}
+        print("Deprecated --keep-secrets: use one --credential-env NAME per intended provider", file=sys.stderr)
+    if not requested <= CREDENTIALS - {"SSH_AUTH_SOCK"}:
+        raise Error("Credential grant must name a supported provider environment variable")
+    # BROKERED OR AMBIENT, NEVER BOTH. A brokered credential is fetched from
+    # the broker's granted endpoint by the payload; putting the value in the
+    # environment as well would leave an ambient copy beside the ticket, and
+    # the single-issue rule would then bound nothing at all -- anything the
+    # agent starts would read the value without ever asking.
+    brokered = set(getattr(args, "credential_broker", []) or [])
+    if not brokered <= requested:
+        raise Error("A brokered credential must also be granted with "
+                    "--credential-env: " + ", ".join(sorted(brokered - requested)))
+    for name in requested:
+        if name not in os.environ:
+            raise Error("Granted credential variable is not set: " + name)
+        if name in brokered:
+            continue
+        environment[name] = os.environ[name]
+    for name, value in environment.items():
+        command += ["--setenv", name, value]
+    command += ["--", *args.agent_command]
+    return command, net, grants, sorted(requested | ({"codex-account"} if getattr(args, "codex_account", False) else set()))
+
+def fds_to_inherit(holder):
+    """The descriptors the sandbox must be handed. Today: the syscall filter."""
+    fd = holder.get("seccomp_fd")
+    return () if fd is None else (fd,)
+
+
+def limits(args):
+    def apply():
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        # Do not pin RLIMIT_AS to the RSS budget. Codex code-mode-host's V8
+        # sandbox reserves ~1 TiB of virtual address space on first execute;
+        # a 3072 MiB AS cap kills it with SIGTRAP. Physical memory stays
+        # capped by the systemd scope MemoryMax below.
+        resource.setrlimit(resource.RLIMIT_CPU, (args.cpu_seconds, args.cpu_seconds + 1))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (256, 256))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (8 * 1024**3, 8 * 1024**3))
+    return apply
+
+# Variables that decide what CODE a program runs before it runs its own. The
+# launch chain -- systemd-run, unshare, the namespace helper's interpreter,
+# bwrap -- all execute OUTSIDE the sandbox, before `bwrap --clearenv` takes
+# effect, and they inherited the caller's environment wholesale.
+#
+# THE ATTACK THAT FOUND THIS, reproduced: a PYTHONPATH pointing at a
+# sitecustomize.py ran attacker code inside the helper before `nft -f -`
+# installed the ruleset, blanked the ruleset argument, and the sandbox then
+# reached 8.8.8.8 and the LAN with an allowlist naming neither -- while the
+# started record said `egress_allowlist: enforced` and `network: enforced`. An
+# LD_PRELOAD constructor fired in systemd-run, in unshare AND in bwrap itself.
+#
+# This is the shape this codebase keeps finding: an enforcement claim whose real
+# mechanism is the caller's cooperation, with a clean audit record on top. The
+# containment is not allowed to depend on the environment Firebreak was invoked
+# with, so the environment the chain runs in is built rather than inherited.
+HOSTILE_ENV = (
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "LD_DEBUG_OUTPUT",
+    "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME", "PYTHONEXECUTABLE",
+    "PYTHONWARNINGS", "PYTHONINSPECT", "PYTHONUSERBASE",
+    "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "IFS", "GLIBC_TUNABLES",
+    "PERL5LIB", "PERL5OPT", "RUBYOPT", "NODE_OPTIONS",
+)
+
+
+def user_service_env():
+    """The environment the launch chain runs in. BUILT, not inherited.
+
+    PATH is pinned as well: the programs in the chain are named absolutely, but
+    each of them resolves its OWN helpers through the PATH it inherits, and a
+    program that decides containment must not be handed a search path the
+    caller chose.
+    """
+    env = dict(os.environ)
+    for name in HOSTILE_ENV:
+        env.pop(name, None)
+    env["PATH"] = TRUSTED_PATH
+    runtime = Path("/run/user") / str(os.getuid())
+    if (runtime / "bus").is_socket():
+        env.setdefault("XDG_RUNTIME_DIR", str(runtime))
+        env.setdefault("DBUS_SESSION_BUS_ADDRESS", "unix:path=" + str(runtime / "bus"))
+    return env
+
+
+# The programs that build and police the sandbox's network. Absolute paths:
+# these decide whether a sandbox is contained, and a helper found on PATH would
+# let the caller choose what "contained" means.
+BWRAP_PATHS = ("/usr/bin/bwrap", "/bin/bwrap")
+UNSHARE_PATHS = ("/usr/bin/unshare", "/bin/unshare")
+NFT_PATHS = ("/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft")
+EGRESS_DNS_TIMEOUT = 10
+
+
+def trusted_program(candidates, what):
+    for candidate in candidates:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    raise Error("no %s exists at any of %s, and the sandbox will not run "
+                "without it rather than run unfiltered"
+                % (what, " or ".join(candidates)))
+
+
+def egress_addresses(hosts):
+    """Resolve the declared allowlist to IPv4 literals, on the HOST.
+
+    The filter is by address because that is what a packet carries. Resolving
+    here rather than in the sandbox is deliberate: the sandbox never gets to
+    choose what a name means. The cost is stated rather than hidden -- a host
+    whose address set changes after this moment (a CDN, a failover) is no longer
+    reachable until the next run, and a name that resolves to several addresses
+    is pinned to the ones seen now.
+    """
+    resolved = {}
+    for host in hosts:
+        try:
+            infos = socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)
+        except OSError as exc:
+            raise Error("cannot resolve the declared egress host %s: %s. The "
+                        "sandbox is not started with an allowlist that could not "
+                        "be turned into addresses" % (redact(host), redact(exc)))
+        resolved[host] = sorted({info[4][0] for info in infos})
+    return resolved
+
+
+def egress_ruleset(addresses):
+    """The nftables policy the sandbox runs under.
+
+    Default drop. The slirp subnet is allowed because that is the NAT itself --
+    the gateway and its DNS -- and without it nothing resolves or routes. Every
+    other destination must be an address the allowlist named.
+    """
+    lines = ["table inet sfegress {",
+             "  chain output {",
+             "    type filter hook output priority 0; policy drop;",
+             "    ct state established,related counter accept",
+             '    oif "lo" counter accept',
+             "    ip daddr 10.0.2.0/24 counter accept"]
+    for host, ips in sorted(addresses.items()):
+        for ip in ips:
+            lines.append("    ip daddr %s counter accept" % ip)
+    lines += ["    counter drop", "  }", "}"]
+    return "\n".join(lines) + "\n"
+
+
+# The helper that owns the namespace. It runs INSIDE a fresh user+net namespace,
+# so it holds CAP_NET_ADMIN there and can install the filter without anybody
+# reaching in from outside -- which is the step that could not be made to work
+# when bwrap owned the namespace.
+EGRESS_HELPER = r"""
+import os, subprocess, sys
+pid_path, ready_path, nft_bin, rules = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+with open(pid_path, "w") as handle:
+    handle.write(str(os.getpid()))
+# Block until the NAT has been attached from outside. A payload that ran before
+# this point would run on an unconfigured interface.
+with open(ready_path) as handle:
+    handle.read(1)
+subprocess.run(["/usr/sbin/ip", "link", "set", "lo", "up"],
+               check=False, capture_output=True)
+if rules:
+    done = subprocess.run([nft_bin, "-f", "-"], input=rules,
+                          text=True, capture_output=True)
+    if done.returncode != 0:
+        sys.stderr.write("firebreak: the egress allowlist did not install: "
+                         + done.stderr[-300:])
+        raise SystemExit(70)
+os.execv(sys.argv[5], sys.argv[5:])
+"""
+
+
+# The user-space NAT that gives an isolated namespace outbound connectivity.
+# Absolute paths: this decides whether a sandbox is contained, and a helper
+# found on PATH would let the caller choose what "contained" means.
+SLIRP_PATHS = ("/usr/bin/slirp4netns", "/bin/slirp4netns")
+SLIRP_READY_TIMEOUT = 20
+
+
+def slirp_binary():
+    for candidate in SLIRP_PATHS:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def attach_network(child_pid, ready_w):
+    """NAT the sandbox's namespace to the outside, and only to the outside.
+
+    --disable-host-loopback is the point of the exercise: without it the NAT
+    gateway forwards to the host's 127.0.0.1 and the namespace buys nothing.
+    """
+    binary = slirp_binary()
+    if binary is None:
+        raise Error(
+            "network access was requested but no slirp4netns exists at "
+            + " or ".join(SLIRP_PATHS)
+            + ". Firebreak will not fall back to sharing the host network: "
+            "that is the containment this session asked for")
+    return subprocess.Popen(
+        [binary, "--configure", "--mtu=65520", "--disable-host-loopback",
+         "--ready-fd", str(ready_w), str(child_pid), "tap0"],
+        pass_fds=(ready_w,), stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE, text=True)
+
+
+def terminate_nat(nat):
+    """The NAT dies with the session. It holds the sandbox namespace open, so
+    leaving it running would leave a namespace and a helper behind per run."""
+    if nat is None or nat.poll() is not None:
+        return
+    nat.terminate()
+    try:
+        nat.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        nat.kill()
+        nat.wait(timeout=5)
+
+
+# What a mask actually is, per kind of thing being masked. bwrap has no
+# --mask-path -- which is what Firebreak's old comment meant -- but it does not
+# need one: an empty tmpfs hides a directory's contents and /dev/null over a
+# file makes every read return EOF. Both are mounts in the sandbox's own mount
+# namespace, so no cooperation from the payload is involved.
+def mask_targets(args, ws):
+    """The bwrap arguments that hide each declared path. Refuses paths outside
+    the workspace.
+
+    Returns a list of argument lists so the caller can extend argv in order.
+    """
+    out = []
+    for raw in (getattr(args, "mask_path", None) or []):
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            raise Error("A masked path must be absolute: " + redact(str(raw)))
+        # Resolved so a symlink cannot nominate a different target. The mount
+        # lands INSIDE the sandbox's own mount namespace, so it changes nothing
+        # on the host -- an earlier draft refused any path outside the workspace
+        # on the theory that it was a way to break the host, which was simply
+        # wrong, and would have refused every run of the shipped codex manifest,
+        # whose masks are /home/agent/.ssh and /etc/shadow.
+        resolved = Path(os.path.realpath(str(candidate)))
+        if resolved.is_dir():
+            # An empty tmpfs: the directory exists and is empty, which is what a
+            # build expecting the directory to be present needs.
+            out.append(["--tmpfs", str(resolved)])
+        else:
+            # /dev/null over the file: it opens, and reads return nothing.
+            # Also the right answer for a path that does not exist on the host --
+            # bwrap creates the mount point, so the sandbox sees an empty file
+            # where the payload expected a secret.
+            out.append(["--ro-bind", "/dev/null", str(resolved)])
+    return out
+
+
+def refusal_record(sid, run_id, started, args, ws, net, exc, before):
+    """The one line a refusal leaves behind.
+
+    A REFUSAL IS A DECISION, AND IT IS THE ONE WORTH KEEPING. Two things can now
+    refuse before a sandbox exists -- an egress host that resolves to no
+    address, and a kernel that will not load the syscall filter -- and both
+    happen before the started record is written, so without this they left the
+    audit directory looking as though nobody had asked.
+    """
+    return {"record": "refused", "schema": RECORD_SCHEMA,
+            "firebreak": VERSION, "at": started, "started": started,
+            "session": sid, "run": run_id,
+            "mission": getattr(args, "mission", None),
+            "task": getattr(args, "task", None),
+            "workspace": str(ws),
+            "network_requested": args.net,
+            "network_effective": net,
+            "egress_allowlist_requested": [
+                redact(str(host)) for host in
+                (getattr(args, "egress_host", None) or [])],
+            "refused_before": before,
+            "reason": redact(exc)}
+
+
+def run(args):
+    """Cleanup wrapper.
+
+    The networked posture needs a scratch directory before the argv exists --
+    the resolver file is bound BY the argv -- and it holds the namespace pid
+    file and the release FIFO as well. It must not survive any exit path,
+    including the ones that refuse before a sandbox is ever built, so the
+    directory is owned here and the work happens below.
+    """
+    holder = {"scratch": None, "seccomp_fd": None}
+    try:
+        return _run(args, holder)
+    finally:
+        if holder["scratch"]:
+            shutil.rmtree(holder["scratch"], ignore_errors=True)
+        # The syscall filter's descriptor is inherited by the sandbox and read
+        # by bwrap; it belongs to this process until the sandbox is gone, and to
+        # nobody afterwards.
+        if holder.get("seccomp_fd") is not None:
+            try:
+                os.close(holder["seccomp_fd"])
+            except OSError:
+                pass
+
+
+def _run(args, holder):
+    if args.agent_command and args.agent_command[0] == "--":
+        args.agent_command.pop(0)
+    if not args.agent_command:
+        raise Error("No agent command; place it after --")
+    if not trusted_which("bwrap"):
+        raise Error("bubblewrap is not installed")
+    if not 256 <= args.memory_mb <= 65536 or not 1 <= args.cpu_seconds <= 86400 or not 8 <= args.processes <= 1024:
+        raise Error("Invalid memory, CPU time or process limit")
+    ws = workspace(args.workspace)
+    sid = session_id(getattr(args, "session_id", None))
+    resolv = None
+    if effective_network(args) == "allow":
+        holder["scratch"] = tempfile.mkdtemp(prefix="sf-egress-")
+        resolv = os.path.join(holder["scratch"], "resolv.conf")
+        with open(resolv, "w", encoding="utf-8") as handle:
+            handle.write(SLIRP_RESOLV_CONF)
+        os.chmod(resolv, 0o644)
+    try:
+        cmd, net, grants, credentials = arguments(args, ws, sid, resolv=resolv)
+    except SeccompUnavailable as exc:
+        # Same posture as the egress filter one screen down: a control that
+        # cannot be applied stops the run, and the refusal is written down
+        # before the exception leaves. Only this one exception is caught here --
+        # every other way arguments() can refuse keeps the behaviour it had.
+        try:
+            append_record(state() / (sid + ".session"),
+                          refusal_record(
+                              sid, uuid.uuid4().hex,
+                              datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                              args, ws, effective_network(args), exc,
+                              "syscall-filter"))
+        except OSError as write_failure:
+            print("Firebreak: the refusal of session " + sid
+                  + " was not recorded: " + redact(write_failure), file=sys.stderr)
+        raise
+    # Inherited by the sandbox, closed by run() once it is gone.
+    holder["seccomp_fd"] = seccomp_fd_in(cmd)
+    # The values behind the granted identities, so the record can strike them
+    # from an argv by EQUALITY. Held only for the length of building the record
+    # and never written anywhere; arguments() read them from this same
+    # environment a moment ago.
+    granted_values = tuple(os.environ[name] for name in credentials
+                           if name in os.environ)
+    if not trusted_which("systemd-run"):
+        raise Error("systemd-run is required for per-session CPU, memory and process limits")
+    # RLIMIT_NPROC counts all threads for the desktop UID, including unrelated
+    # applications. A dedicated cgroup enforces this session's actual task cap.
+    cmd = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--unit=" + sid, "--description=Shadowfetch Firebreak isolated task", "--property=TasksMax=" + str(args.processes), "--property=MemoryMax=" + str(args.memory_mb) + "M", "--property=MemorySwapMax=0", "--property=CPUQuota=200%", "--", *cmd]
+    checkpoint = None
+    if not args.no_checkpoint:
+        # --json: the recovery id comes back as a value. Splitting the human
+        # sentence made the wording of that sentence the recovery contract, and
+        # silently truncated any id containing a character outside [0-9-].
+        result = subprocess.run([checkpoint_bin(), "snapshot", ws.name, "--label", "firebreak:" + sid, "--json"], capture_output=True, text=True, timeout=600)
+        if result.returncode:
+            raise Error("Checkpoint failed; execution refused: " + result.stderr[-500:])
+        try:
+            receipt = json.loads(result.stdout)
+            checkpoint = receipt["id"]
+        except (ValueError, TypeError, KeyError):
+            raise Error("Checkpoint engine returned an invalid receipt; execution refused")
+        if not isinstance(checkpoint, str) or not checkpoint.strip():
+            raise Error("Checkpoint engine returned an invalid receipt; execution refused")
+        print("checkpoint " + checkpoint + " taken", flush=True)
+    started = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    # The session id belongs to the caller and may be reused between runs; the
+    # run id is minted here so a started record and an ended record still pair
+    # up unambiguously when it is.
+    run_id = uuid.uuid4().hex
+    directory = state()
+    record = directory / (sid + ".session")
+    # THE RECORDED ARGV HAS TO BE THE ARGV THAT RUNS. Posture 'allow' wraps the
+    # sandbox in a helper that owns the network namespace and installs the
+    # egress filter, so a record built from the bwrap argv alone would omit both
+    # mechanisms doing the containment -- and enforcement(), which reads the
+    # argv rather than the request, would report a namespace nobody created.
+    # Built here, recorded, and spawned unchanged.
+    scratch = holder["scratch"]
+    ready_path = None
+    launch = list(cmd)
+    if net == "allow":
+        try:
+            pid_path = os.path.join(scratch, "ns.pid")
+            ready_path = os.path.join(scratch, "ready")
+            os.mkfifo(ready_path)
+            addresses = egress_addresses(args.egress_host or [])
+            rules = egress_ruleset(addresses) if addresses else ""
+            marker = launch.index("--") + 1
+            # systemd-run wraps the WHOLE tree, so the cgroup limits still cover
+            # the helper, the sandbox and everything they start.
+            launch[marker:marker] = [
+                trusted_program(UNSHARE_PATHS, "unshare"),
+                "--user", "--map-root-user", "--net", "--fork",
+                # -I: isolated, so PYTHON* variables and the user site
+                # directory cannot reach it. -S: no site processing at all,
+                # which is what a sitecustomize.py rides in on. Belt and
+                # braces with HOSTILE_ENV above, because this one interpreter
+                # is the process that installs the filter, and it runs before
+                # anything is contained.
+                "/usr/bin/python3", "-I", "-S", "-c", EGRESS_HELPER,
+                pid_path, ready_path,
+                trusted_program(NFT_PATHS, "nft"), rules]
+        except BaseException as exc:
+            # A REFUSAL IS A DECISION, AND IT IS THE ONE WORTH KEEPING. Building
+            # this argv can refuse -- an egress host that resolves to no address
+            # is refused rather than run unfiltered -- and because the started
+            # record is written after it, that decision left no trace whatsoever:
+            # the audit directory showed no session, as though nobody had asked.
+            # One line, with what is known at this point.
+            try:
+                append_record(record, refusal_record(sid, run_id, started, args,
+                                                     ws, net, exc,
+                                                     "sandbox-launch"))
+            except OSError as write_failure:
+                print("Firebreak: the refusal of session " + sid
+                      + " was not recorded: " + redact(write_failure),
+                      file=sys.stderr)
+            raise
+    program = args.agent_command[0] if args.agent_command else ""
+    resolved, resolution = resolved_executable(program, ws)
+    manifest = {"record": "started",
+                "schema": RECORD_SCHEMA,
+                "firebreak": VERSION,
+                "at": started,
+                "started": started,
+                "session": sid,
+                "run": run_id,
+                "session_id_source": ("orchestrator" if getattr(args, "session_id", None)
+                                      else "firebreak"),
+                "mission": getattr(args, "mission", None),
+                "task": getattr(args, "task", None),
+                "scope_unit": sid + ".scope",
+                "pid": os.getpid(),
+                "parent_pid": os.getppid(),
+                "parent_command": parent_command(),
+                "audit_directory": str(directory),
+                "audit_directory_relocated": state_relocated(),
+                "workspace": str(ws),
+                "workspace_mode_requested": args.workspace_mode,
+                "executable": redact(program),
+                "executable_resolved": resolved,
+                "executable_resolution": resolution,
+                # The resolved values are handed in so a secret appearing in
+                # the caller's own argv -- mytool --api-key VALUE -- is struck by
+                # equality, not merely by shape. The text redactor cannot
+                # recognise a short or arbitrary value, and this file outlives
+                # the process.
+                "agent_command": redacted_argv(args.agent_command,
+                                               values=granted_values),
+                "sandbox_argv": redacted_argv(launch, values=granted_values),
+                "network_requested": args.net,
+                "network_effective": net,
+                # Redacted like everything else: a host can carry credentials
+                # in its userinfo (user:PASSWORD@host) and a path can be under a
+                # directory whose name is a token.
+                "egress_allowlist_requested": [redact(str(host)) for host in
+                                               (getattr(args, "egress_host", None) or [])],
+                "masked_paths_requested": [redact(str(path)) for path in
+                                           (getattr(args, "mask_path", None) or [])],
+                "read_grants": [redact(str(grant)) for grant in grants],
+                # What was ASKED for, including the --keep-secrets expansion.
+                # Recording only the explicit flag showed "nothing requested"
+                # while identities were granted, which reads as a contradiction
+                # to anyone auditing the pair.
+                "credentials_requested": sorted(set(credentials)
+                                                | set(args.credential_env)),
+                # Identities. A credential VALUE has never reached this file and
+                # must not; see redacted_argv().
+                "credential_names": credentials,
+                # HOW, not merely WHETHER. A record that says "credential
+                # granted" without saying how it was delivered is the claim
+                # drift this codebase keeps finding: the two deliveries have
+                # different residuals -- an environment value is readable by
+                # anything the agent starts, for the whole run, unrecorded;
+                # a brokered one is read once, refusably, on an audit chain --
+                # and a reviewer cannot tell them apart from an identity list.
+                "credential_delivery": {
+                    name: ("broker" if name in (getattr(args, "credential_broker", None) or ())
+                           else "environment")
+                    for name in credentials},
+                "checkpoint": checkpoint,
+                "checkpoint_requested": not args.no_checkpoint,
+                "limits_requested": {"memory_mb": args.memory_mb,
+                                     "cpu_seconds": args.cpu_seconds,
+                                     "processes": args.processes},
+                "enforcement": enforcement(launch, args, ws, grants, credentials, net)}
+    # Before the sandbox is spawned, not after: a session that cannot be
+    # recorded is not executed.
+    try:
+        append_record(record, manifest)
+    except BaseException:
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
+        raise
+    process = None
+    rc = None
+    reason = "not-started"
+    def terminate(signum, frame):
+        if process and process.poll() is None:
+            process.terminate()
+        raise KeyboardInterrupt
+    previous = signal.signal(signal.SIGTERM, terminate)
+    try:
+        try:
+            nat = None
+            if net == "allow":
+                # THE NAMESPACE IS OURS FROM THE FIRST INSTANT. bwrap used to
+                # create it, and reaching into bwrap's namespace could not be
+                # made to work: joining it stopped slirp4netns attaching
+                # afterwards, and attaching first made it unjoinable. Both
+                # directions were measured -- see STAGE_C_FINDINGS.md.
+                #
+                # So a helper unshares user+net, slirp attaches the NAT to that
+                # namespace from outside, the helper installs the allowlist
+                # ITSELF (it holds CAP_NET_ADMIN over the namespace it just
+                # created, so no nsenter is needed at all), and it finally execs
+                # bwrap WITHOUT --unshare-net. The sandbox inherits a namespace
+                # that is already NAT'd and already filtered. The argv for all
+                # of that was built and recorded above, and is spawned as-is.
+                # pass_fds: bwrap reads the syscall filter from this exact
+                # number after two execve's (systemd-run, then the namespace
+                # helper), so it must survive both -- subprocess otherwise closes
+                # it, and bwrap would exit "Invalid file descriptor" rather than
+                # run unfiltered.
+                process = subprocess.Popen(launch, preexec_fn=limits(args),
+                                           env=user_service_env(),
+                                           pass_fds=fds_to_inherit(holder))
+                nat = None
+                try:
+                    deadline = time.monotonic() + 20
+                    ns_pid = None
+                    pid_file = os.path.join(scratch, "ns.pid")
+                    while time.monotonic() < deadline:
+                        try:
+                            with open(pid_file) as handle:
+                                text = handle.read().strip()
+                        except OSError:
+                            text = ""
+                        if text.isdigit():
+                            ns_pid = int(text)
+                            break
+                        if process.poll() is not None:
+                            break
+                        time.sleep(0.05)
+                    if ns_pid is None:
+                        raise Error(
+                            "the network namespace helper never reported itself, "
+                            "so no NAT could be attached and execution is refused "
+                            "rather than run unfiltered")
+                    ready_r, ready_w = os.pipe()
+                    nat = attach_network(ns_pid, ready_w)
+                    os.close(ready_w)
+                    with os.fdopen(ready_r, "rb") as handle:
+                        if not handle.read(1):
+                            raise Error(
+                                "the network helper exited before the sandbox "
+                                "interface came up: "
+                                + (nat.stderr.read() if nat.stderr else "")[-300:])
+                    with open(ready_path, "w") as handle:
+                        handle.write("go")     # release the helper
+                    rc = process.wait()
+                finally:
+                    terminate_nat(nat)
+                    shutil.rmtree(scratch, ignore_errors=True)
+            else:
+                process = subprocess.Popen(cmd, preexec_fn=limits(args),
+                                           env=user_service_env(),
+                                           pass_fds=fds_to_inherit(holder))
+                rc = process.wait()
+            reason = ("signal:" + signal_name(-rc) if rc < 0
+                      else "completed" if rc == 0 else "nonzero-exit")
+        except KeyboardInterrupt:
+            rc, reason = 130, "cancelled"
+            if process and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+        try:
+            append_record(record, {"record": "ended", "schema": RECORD_SCHEMA,
+                                   "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                   "started": started,
+                                   "session": sid, "run": run_id,
+                                   "mission": getattr(args, "mission", None),
+                                   "task": getattr(args, "task", None),
+                                   "exit": rc, "exit_reason": reason,
+                                   "checkpoint": checkpoint})
+        except OSError as exc:
+            # Said out loud rather than swallowed, and never in place of the
+            # exception already on its way out of this block.
+            print("Firebreak: the end of session " + sid + " was not recorded: "
+                  + redact(exc), file=sys.stderr)
+    print(f"Firebreak session {sid} ended (exit {rc})", file=sys.stderr)
+    if checkpoint:
+        print(f"Undo: shadowfetch-checkpoint undo {ws.name} {checkpoint}", file=sys.stderr)
+    return rc if rc >= 0 else 128 - rc
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version="shadowfetch-firebreak (Shadowfetch Linux) " + VERSION)
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("check")
+    log = sub.add_parser("log")
+    log.add_argument("count", nargs="?", type=int, default=10)
+    execute = sub.add_parser("run")
+    execute.add_argument("--session-id", default=None,
+                         help="Correlation id issued by the orchestrator; one identity "
+                              "across Mission Control, this sandbox and the audit log")
+    execute.add_argument("--mission", default=None,
+                         help="Mission this session belongs to, recorded for audit")
+    execute.add_argument("--task", default=None,
+                         help="Task within the mission, recorded for audit")
+    execute.add_argument("--workspace", default="")
+    execute.add_argument("--net", choices=("none", "allow"))
+    execute.add_argument("--read", action="append", default=[], metavar="ABSOLUTE_PATH")
+    execute.add_argument("--codex-account", action="store_true", help="Grant the dedicated Mission Control account for an approved cloud task")
+    execute.add_argument("--credential-env", action="append", default=[], metavar="NAME")
+    execute.add_argument("--credential-broker", action="append", default=[], metavar="NAME",
+                         help="Deliver this granted identity over the broker's "
+                              "endpoint instead of the sandbox environment. The "
+                              "value is NOT placed in the environment; the "
+                              "payload redeems a single-use ticket. Must also be "
+                              "named by --credential-env, which is what decides "
+                              "the identity is granted at all")
+    execute.add_argument("--egress-host", action="append", default=[], metavar="HOST",
+                         help="Destination the sandbox may reach under --net allow. "
+                              "Resolved to addresses on the host at launch and installed "
+                              "as a default-DROP nftables ruleset in the sandbox's own "
+                              "network namespace, before the payload starts. Filtering is "
+                              "BY ADDRESS: a name whose address set changes afterwards is "
+                              "unreachable until the next run. Under --net none there is "
+                              "no route to filter and the record says so")
+    execute.add_argument("--mask-path", action="append", default=[], metavar="ABSOLUTE_PATH",
+                         help="Path inside the workspace to hide from the sandbox. A "
+                              "directory becomes an empty tmpfs, a file becomes "
+                              "/dev/null. Enforced by the mount namespace, not by the "
+                              "payload's cooperation. A path outside the workspace is "
+                              "refused. Masking is by path: a hardlink to the same "
+                              "inode under an unmasked name is still readable")
+    execute.add_argument("--keep-secrets", action="store_true", help="Deprecated explicit provider credential pass-through")
+    execute.add_argument("--no-checkpoint", action="store_true", help="For callers that already own a recovery checkpoint")
+    execute.add_argument("--workspace-mode", choices=("workspace-write", "read-only"), default="workspace-write")
+    execute.add_argument("--memory-mb", type=int, default=4096)
+    execute.add_argument("--cpu-seconds", type=int, default=900)
+    execute.add_argument("--processes", type=int, default=128)
+    execute.add_argument("agent_command", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "run":
+            return run(args)
+        if args.command == "log":
+            directory = state()
+            if state_relocated():
+                print("Firebreak: reading relocated audit state at " + str(directory), file=sys.stderr)
+            for file in sorted(directory.glob("*.session"), key=lambda p:p.stat().st_mtime, reverse=True)[:max(0, min(args.count, 100))]:
+                for entry in read_records(file):
+                    print(json.dumps(entry, indent=2, sort_keys=True))
+            return 0
+        if args.command == "check":
+            bwrap = trusted_which("bwrap")
+            if not bwrap:
+                raise Error("bubblewrap is missing")
+            probe = subprocess.run([bwrap, "--ro-bind", "/usr", "/usr", "--symlink", "usr/bin", "/bin", "--symlink", "usr/lib", "/lib", "--symlink", "usr/lib64", "/lib64", "--unshare-user", "--unshare-pid", "--proc", "/proc", "--", "/usr/bin/true"], capture_output=True, text=True, timeout=10)
+            if probe.returncode:
+                raise Error("Sandbox namespaces cannot start: " + probe.stderr.strip())
+            if not Path(checkpoint_bin()).exists() and not trusted_which(checkpoint_bin()):
+                raise Error("Checkpoint engine is missing")
+            # The filter is loaded for real here, not described: `check` that
+            # only printed a sentence would pass on a kernel where a session
+            # would then be refused.
+            os.close(seccomp_filter_fd())
+            reachable = seccomp_reachable()
+            print("Firebreak ready: namespaces execute, private home, explicit read grants, recovery available")
+            print("Syscall filter: %d calls denied EPERM (%d of them measurably "
+                  "reachable in this sandbox before it existed), sha256 %s, and "
+                  "this kernel loaded it -- %s"
+                  % (len(SECCOMP_DENY), len(reachable), seccomp_digest()[:16],
+                     seccomp_selftest()))
+            return 0
+        parser.print_help()
+        return 0
+    except (Error, OSError, subprocess.TimeoutExpired) as exc:
+        print("Firebreak: " + redact(exc), file=sys.stderr)
+        return 1
+
+if __name__ == "__main__":
+    raise SystemExit(main())

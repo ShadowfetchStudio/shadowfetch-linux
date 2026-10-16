@@ -1,0 +1,135 @@
+shadowfetch-missions (5.0.1-1) umbra; urgency=medium
+
+  * "database is busy" under heavy disk load (5.0.0 STRESS-01): no Store
+    connection checkpoints the WAL on close any more
+    (SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE). The last close used to copy the WAL
+    back into the database under an exclusive lock held across two fsyncs,
+    so `show`, `list` and the desktop's reads ran out of their 10 s budget
+    while the worker finished a step. SQLite's passive auto-checkpoint after
+    a commit keeps the WAL bounded and blocks no one; short CLI commands
+    also turn auto-checkpoint off, so no fsync lands on them after they
+    commit. Durability is unchanged.
+  * `cancel` saves the stop request as a small file in the private state
+    directory first and waits at most 2 s for the database. When it is busy,
+    cancel answers exit 0 with cancel_pending and a notice, and the worker
+    records the ordinary hash-chained cancel from its next check. Once the
+    request is saved, cancel's own commit does not wait on the disk
+    (synchronous=NORMAL), and the worker deletes the request only after
+    syncing the WAL. A stop that arrives after the run's last check is
+    recorded with the outcome, or as the new event cancel-arrived-late, and
+    is never dropped; a queued mission whose stop is not yet recorded is not
+    started. If the request cannot be written, cancel writes directly as
+    5.0.0 did. Only a regular file is read as a request.
+  * Missions created in the same second run, and list, in the order they
+    were created (created_at, then insertion order). 5.0.0 broke the tie on
+    the random mission id.
+  * `show` and `list` report a derived `hold` for a queued mission the review
+    gate is holding: the blocking mission's id and title and a message. The
+    worker gates on the same hold, so the reason shown and the rule enforced
+    cannot disagree. Nothing new is written to the database.
+  * Depends: python3 (>= 3.12), for Connection.setconfig; the image ships a
+    newer Python. The shadowfetch-fireline floor moves to 5.0.1.
+  * Reports version 5.0.1.
+
+ -- Shadowfetch Project <signing@shadowfetch.com>  Wed, 30 Sep 2026 23:15:00 -0400
+
+shadowfetch-missions (5.0.0-1) umbra; urgency=medium
+
+  * Retry read-only queries (mission get, list and events) on a transient
+    "database is locked", up to six attempts with a 0.05-0.5 s backoff,
+    instead of failing the call. Writes still fail loudly.
+  * Depends on shadowfetch-fireline (>= 5.0.0), whose Firebreak reads the
+    agent network setting.
+  * debian/copyright: Source is github.com/Shadowfetchapps/shadowfetch-linux.
+
+ -- Shadowfetch Project <signing@shadowfetch.com>  Mon, 28 Sep 2026 18:30:00 -0400
+
+shadowfetch-missions (4.1.0-1) umbra; urgency=medium
+
+  * BREAKING: a mission must name its provider when more than one installed
+    provider can serve the capability. Where only one can, the choice is
+    still made for you.
+  * BREAKING: an approval now covers the mission's network destinations, so
+    Scope carries egress_hosts. A mission whose declared egress widens after
+    approval is refused; the attack that widened it previously reported that
+    the destination change was neither prevented nor detected.
+  * Add Claude and a local-model provider, for four alongside Codex and
+    offline media. The local model bridge is packaged rather than left under
+    tests, and capabilities() reads local_ai from the registry instead of
+    the literal string "deferred".
+  * A revoked approval can no longer start a mission. require_approval()
+    re-read revoked_at under BEGIN IMMEDIATE and then released it, and the
+    approval-used record and the mission's approval_id followed on two
+    further connections, so a revoke landing in that gap was chained BEFORE
+    the use -- the exact "granted, revoked, used" log the code's own comment
+    claimed to prevent. All three steps are one transaction now: 20 of 300
+    trials started before, 0 of 300 after.
+  * The approval gate runs in the engine before the state transition, so
+    there is no window in which an unapproved mission is running, and every
+    entry point -- CLI, worker, desktop -- is covered because they all come
+    through run_mission. Scope is recomputed at run time from the provider's
+    declared ceiling, not from what the mission claimed when it was
+    approved.
+  * Model selection is the provider's decision; the engine bounds only the
+    string.
+  * The worker unit no longer names one provider's credential file, so a
+    second provider's key reached nothing. Each provider's credentials are
+    read from its own file.
+  * PRAGMA journal_mode=WAL ran before busy_timeout, and SQLite does not run
+    the busy handler for a journal-mode conversion, so 16 of 48 concurrent
+    opens raised and 6 of 18 CLI invocations produced empty stdout and a
+    traceback -- to a desktop that parses stdout as JSON.
+  * The domain rows a receipt reprints as fact -- which provider ran, which
+    executable, what the sandbox enforced, which credentials were granted,
+    which tools ran under which policy decision, whether the tests passed,
+    who reviewed it and what they decided -- are bound to the event that
+    commits them, so they can no longer be rewritten while `audit verify`
+    reports the chain intact.
+  * The blast classifier can no longer be silenced by the thing it
+    classifies: a mission appending two lines to its own .git/config made it
+    report "no remote configured" while git remote -v showed the push
+    remote. git is also no longer invoked as a bare name, and
+    executable_config no longer misses credential.helper.
+  * Replace the 1 Hz worker poll with inotify on the state directory.
+    Measured on an empty queue: idle CPU 0.128% of a core to unmeasurable,
+    2,880 write syscalls per 180s to 1, 225 MiB/hour of dirtied page cache
+    to 0, and median wake latency 0.447s to 0.0003s. Without inotify it
+    becomes a plain 30s sleep and says so once on stderr rather than looking
+    event-driven.
+  * Workspace locks are a hierarchy, not one file each: a workspace
+    operation takes the global lock shared and its own exclusive, a
+    whole-system operation takes the global exclusive. The first version
+    stopped excluding anything while a worker held the global lock during
+    recovery.
+  * Reconciliation settles crashed tasks and sessions, not stale missions
+    alone.
+  * seal_policy could not seal a new provider at all: it never emitted
+    executable_trust, which approve() refuses without.
+  * The recorded argv is the argv that runs -- the namespace helper was
+    missing from it -- and a refusal before launch is recorded instead of
+    vanishing.
+  * The receipt a person reads before accepting agent work named two
+    enforced controls as decorative and named two fields absent from the
+    list it claimed to explain; it is derived from that list now. The
+    credential broker's "race-losable" framing is corrected in the shipped
+    text: an attacker sharing the sandbox holds the same ticket and may
+    simply ask first.
+
+ -- Shadowfetch Project <signing@shadowfetch.com>  Wed, 09 Sep 2026 18:28:58 -0400
+
+shadowfetch-missions (4.0.0-1) umbra; urgency=medium
+
+  * Shadowfetch Linux 4.0 Mission Control release.
+  * Publish terminal state and activity together after the receipt is durable.
+  * Wait briefly for review ownership, preserving a clear unapplied busy result.
+  * Integrate persistent missions, scoped execution and featured Grok Bot setup.
+  * Defer local AI providers; retain Codex code/report and offline media missions.
+  * Support a private per-user Codex worker environment file.
+
+ -- Shadowfetch Project <signing@shadowfetch.com>  Sat, 05 Sep 2026 03:00:00 +0000
+
+shadowfetch-missions (4.0.0) unstable; urgency=medium
+
+  * Introduce durable Mission Control execution, receipts, review and recovery.
+
+ -- Shadowfetch Project <signing@shadowfetch.com>  Fri, 04 Sep 2026 21:00:00 -0400

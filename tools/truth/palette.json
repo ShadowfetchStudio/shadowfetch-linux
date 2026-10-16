@@ -1,0 +1,173 @@
+{
+  "schema": 1,
+  "_note": [
+    "SINGLE SOURCE OF TRUTH for the Shadowfetch palette (ADR-0009).",
+    "Defect this file exists for: ARCHITECTURE_AUDIT.md:246 counted five copies",
+    "of the palette with three different reds and greens, one of which",
+    "(shadowfetch-fireproof) renders INSIDE the Control Center window with a",
+    "different red from the window around it.",
+    "",
+    "5.0.0: ONE look, ShadowCode -- gold / brushed dark steel on near-black.",
+    "The 3.1-4.1 Fire and Ice pair is gone: Fire's Umbra gold evolved into the",
+    "brighter ShadowCode gold, and every Ice asset (ShadowfetchIce, Glacier,",
+    "org.shadowfetch.ice, UmbraIce) was removed. Upgraded desktops are moved",
+    "off removed assets by /usr/lib/shadowfetch/look-migrate.sh.",
+    "",
+    "Two rules govern every value below and the drift gate enforces both:",
+    "  1. BRAND roles (accent, accent_bright, accent_deep, silver) live in the",
+    "     single element 'shadowcode'. The gold is sampled from the ShadowCode",
+    "     emblem's lit faces and wordmark (#EEB43C..#F4BF48); silver is the",
+    "     'CODE' half of the wordmark (#BCBFC5), for secondary accents.",
+    "  2. SEMANTIC roles (negative, warning, positive, link) are ELEMENT-",
+    "     INVARIANT and must stay distinct from the accent. 5.0.0 moved warning",
+    "     from #E0A33A to #E68F2E (and warning_dim with it): the old amber sat",
+    "     CIEDE2000 4.6 from the new gold, the new one sits 11.6 from it and",
+    "     29.4 from negative, and still reads 7.5:1 on the window colour.",
+    "",
+    "Three SURFACES are recorded, not one. They genuinely differ and the",
+    "difference is deliberate; collapsing them would be a re-skin, not a dedup.",
+    "Each copy must match ITS surface exactly -- that is what the gate checks.",
+    "",
+    "WCAG contrast (checked when these values were chosen):",
+    "  desktop text #D6DBE1 on window 13.6:1, on ink 14.0:1",
+    "  accent #F2B33D on window 10.2:1, on ink 10.5:1; ink on accent 10.5:1",
+    "  accent_deep #B97E22 on window 5.5:1; silver #BCC0C6 on window 10.4:1",
+    "  app-chrome text on bg 15.6:1; gold on bg 9.7:1, on card 8.6:1",
+    "  document text on bg 15.9:1; gold on bg 10.4:1, on card 9.5:1"
+  ],
+  "provenance": {
+    "spec": "branding/umbra-v2/UMBRA-THEME-SPEC.md",
+    "sampled": "2026-05-29, color-sampled from the 20 Umbra v2 reference frames",
+    "shadowcode": "2026-09-28, gold and silver sampled from shadowcode-original.png (sha256 653b36e0...920f): lit emblem faces p90 #EEB43C, wordmark gold #F4BF48, wordmark steel #BCBFC5, background #080B0F"
+  },
+  "elements": {
+    "shadowcode": {
+      "accent": "#F2B33D",
+      "accent_bright": "#FFC95E",
+      "accent_deep": "#B97E22",
+      "silver": "#BCC0C6",
+      "plasma_color_scheme": "ShadowfetchDark",
+      "plasma_scheme_name": "ShadowCode",
+      "konsole_scheme": "ShadowfetchUmbra",
+      "konsole_description": "ShadowCode",
+      "look_and_feel": "org.shadowfetch.dark",
+      "look_and_feel_name": "ShadowCode",
+      "wallpaper_package": "ShadowCode",
+      "wallpaper_image": "/usr/share/backgrounds/shadowfetch/shadowcode-4k.jpg"
+    }
+  },
+  "semantic": {
+    "_note": "Element-invariant. Distinct from the accent. See rule 2 above.",
+    "negative": "#E0484B",
+    "negative_intense": "#FF5C5F",
+    "negative_dim": "#5A1414",
+    "warning": "#E68F2E",
+    "warning_dim": "#5A3510",
+    "positive": "#34D058",
+    "positive_intense": "#5FE08A",
+    "positive_dim": "#145023",
+    "link": "#4FA6B8",
+    "link_intense": "#7FD0DE"
+  },
+  "surfaces": {
+    "desktop": {
+      "_note": [
+        "The Plasma/SDDM/Konsole/splash surface. Values are the Umbra v2",
+        "sampled tokens. Assets on this surface are GENERATED, not hand-edited:",
+        "  tools/generate_theme_assets.py"
+      ],
+      "consumers": [
+        "packages/shadowfetch-themes/data/usr/share/color-schemes/ShadowfetchDark.colors",
+        "packages/shadowfetch-themes/data/usr/share/konsole/ShadowfetchUmbra.colorscheme",
+        "packages/shadowfetch-themes/data/usr/share/sddm/themes/umbra/theme.conf",
+        "packages/shadowfetch-themes/data/usr/share/plasma/look-and-feel/*/contents/splash/Splash.qml"
+      ],
+      "roles": {
+        "ink": "#0A0D11",
+        "abyss": "#05080B",
+        "ink_raised": "#101419",
+        "window": "#0E1116",
+        "header": "#14181E",
+        "steel": "#161A20",
+        "steel_raised": "#1E242B",
+        "slate": "#2C333B",
+        "graphite": "#4A4F56",
+        "mist": "#9AA3AD",
+        "text": "#D6DBE1",
+        "splash_bar": "#262B33",
+        "ansi_blue": "#3E8E9E",
+        "ansi_blue_intense": "#5FC2D4",
+        "ansi_magenta": "#A678C8",
+        "ansi_magenta_intense": "#C39BE0",
+        "ansi_white": "#C7CDD4",
+        "ansi_white_intense": "#EEF1F4",
+        "terminal_foreground": "#CBD2D9"
+      }
+    },
+    "app-chrome": {
+      "_note": [
+        "The PyQt6 Control Center chrome. Deep graphite, shipped since 2.1.1.",
+        "shadowfetch-fireproof's window is mounted INSIDE this one, so it must",
+        "use these values and not its own -- that was the audit's named defect."
+      ],
+      "consumers": [
+        "packages/shadowfetch-control-center/data/usr/share/shadowfetch/control-center/sfcc/theme.py",
+        "packages/shadowfetch-fireproof/data/usr/bin/shadowfetch-fireproof"
+      ],
+      "roles": {
+        "bg": "#151619",
+        "card": "#202126",
+        "card_hover": "#26272d",
+        "border": "#34363d",
+        "text": "#f0eee9",
+        "muted": "#aaa69f",
+        "green": "#72c69c",
+        "amber": "#e8b65e",
+        "orange": "#ef8b3a",
+        "red": "#e2533b",
+        "ink": "#151515"
+      },
+      "element_roles": {
+        "shadowcode": {
+          "gold": "#f2b33d",
+          "gold_hover": "#ffc95e",
+          "gold_press": "#b97e22",
+          "silver": "#bcc0c6"
+        }
+      }
+    },
+    "document": {
+      "_note": [
+        "Exported/standalone HTML and the first-boot Welcome window: the Umbra",
+        "v2 document look, carrying the ShadowCode gold. Distinct from app-chrome on",
+        "purpose -- these render outside the Control Center, in a browser or on their own."
+      ],
+      "consumers": [
+        "packages/shadowfetch-welcome/src/shadowfetch-welcome",
+        "packages/shadowfetch-defaults/data/usr/bin/shadowfetch-passport",
+        "packages/shadowfetch-control-center/data/usr/share/shadowfetch/control-center/sfcc/guide_page.py"
+      ],
+      "roles": {
+        "text": "#E6E9ED",
+        "muted": "#9AA3AD",
+        "green": "#7FB069",
+        "red": "#E2533B",
+        "violet": "#9B7EDE",
+        "cyan": "#29B6F6"
+      },
+      "element_roles": {
+        "shadowcode": {
+          "gold": "#F2B33D",
+          "gold_hover": "#FFC95E",
+          "gold_press": "#B97E22",
+          "silver": "#BCC0C6",
+          "bg": "#0B0E12",
+          "card": "#141922",
+          "card_hover": "#1B212C",
+          "border": "#2C333B",
+          "ink": "#0B0E12"
+        }
+      }
+    }
+  }
+}

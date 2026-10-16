@@ -23,13 +23,6 @@ DEFAULTS = ROOT / "packages" / "shadowfetch-defaults"
 WELCOME = ROOT / "packages" / "shadowfetch-welcome" / "src" / "shadowfetch-welcome"
 CONTROL = ROOT / "packages" / "shadowfetch-control-center" / "data"
 PASSPORT = DEFAULTS / "data/usr/bin/shadowfetch-passport"
-PROVISION = DEFAULTS / "data/usr/libexec/shadowfetch-buzz-provision"
-BUZZ = DEFAULTS / "data/usr/bin/shadowfetch-buzz"
-CODEX = DEFAULTS / "data/usr/bin/shadowfetch-codex"
-CODE_AGENTS = DEFAULTS / "data/usr/bin/shadowfetch-code-agent"
-BUZZ_BOOTSTRAP = DEFAULTS / "data/usr/libexec/shadowfetch-buzz-bootstrap"
-BUZZ_STACK = DEFAULTS / "data/usr/libexec/shadowfetch-buzz-stack"
-BUZZ_COMPOSE = DEFAULTS / "data/usr/share/shadowfetch/buzz/compose.yml"
 MIGRATION_HELPER = DEFAULTS / "data/usr/libexec/shadowfetch-migrate-2.1.3-ai"
 MIGRATION_MANIFEST = (
     DEFAULTS / "data/usr/share/shadowfetch/migrations/2.1.3-ai-packages"
@@ -68,7 +61,7 @@ class FireEdition215Tests(unittest.TestCase):
 
     def test_canonical_identity_keeps_verified_raw_artifact_routes(self):
         canonical = "https://www.shadowfetchlinux.org"
-        repository = "https://github.com/ShadowfetchLinux/shadowfetch-linux"
+        repository = "https://github.com/Shadowfetchapps/shadowfetch-linux"
         artifact_base = "https://www.shadowfetch.com/linux"
         os_release = (
             ROOT
@@ -96,7 +89,7 @@ class FireEdition215Tests(unittest.TestCase):
 
     def test_debian_revision_versions_use_quilt_source_format(self):
         formats = sorted((ROOT / "packages").glob("*/debian/source/format"))
-        self.assertEqual(14, len(formats))
+        self.assertEqual(16, len(formats))
         for source_format in formats:
             self.assertEqual("3.0 (quilt)", source_format.read_text().strip())
         makefile = (ROOT / "Makefile").read_text()
@@ -106,9 +99,27 @@ class FireEdition215Tests(unittest.TestCase):
         self.assertIn("dpkg-source -b $$pkg", repo)
         self.assertIn("debsign --no-conf -k$(REPO_KEY_ID)", repo)
 
+    def test_optional_agents_are_named_only_by_their_allowlist(self):
+        """5.0: Hermes and OpenClaw are optional per-user installs, never preinstalled.
+
+        The allowlist is the source gate's, so this test and the release gate
+        cannot disagree about which files may name them.
+        """
+        release = ROOT / "tools" / "release"
+        if str(release) not in sys.path:
+            sys.path.insert(0, str(release))
+        loader = importlib.machinery.SourceFileLoader("fire_source_gate", str(release / "source_gate.py"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        source_gate = importlib.util.module_from_spec(spec)
+        loader.exec_module(source_gate)
+        self.assertEqual([], source_gate.optional_agent_findings(ROOT))
+        for forbidden in ("live-build/config/package-lists/shadowfetch-apps.list.chroot",
+                          "live-build/config/includes.chroot/etc/skel/.hermes/config.yaml"):
+            self.assertFalse(source_gate.optional_agent_reference_allowed(forbidden))
+
     def test_retired_runtimes_are_absent_from_active_image_source(self):
         retired = re.compile(
-            r"openclaw|\bhermes\b|\bollama\b|open[- ]?webui|llama\.cpp|llama-server",
+            r"\bollama\b|open[- ]?webui|llama\.cpp|llama-server",
             re.IGNORECASE,
         )
         roots = [
@@ -201,10 +212,9 @@ class FireEdition215Tests(unittest.TestCase):
         self.assertIn("sha256sum --check", iso)
         self.assertIn("--verify $(ROOT)/$(ISO_NAME).asc", makefile)
         self.assertIn("@$(MAKE) iso-gate", iso)
-        self.assertIn(
-            "ISO_GATE := $(ROOT)/tools/iso_gate_$(VERSION_TOKEN).py",
-            makefile,
-        )
+        # The gate families were consolidated: one implementation plus a
+        # per-version data file, instead of a module copied per release.
+        self.assertIn("ISO_GATE := $(RELEASE_TOOLS)/iso_gate.py", makefile)
         self.assertIn("ISO_GATE_LOG", makefile)
 
     def test_first_boot_uses_utc_rtc_and_network_time(self):
@@ -251,155 +261,34 @@ class FireEdition215Tests(unittest.TestCase):
         self.assertIn("/etc/ssh/ssh_host_ed25519_key", postinst)
         self.assertIn("/etc/ssh/ssh_host_rsa_key", postinst)
 
-    def test_buzz_service_waits_for_explicit_setup_state(self):
-        unit = (
-            DEFAULTS / "data/usr/lib/systemd/user/shadowfetch-buzz.service"
-        ).read_text()
-        self.assertIn(
-            "ConditionPathExists=%h/.local/share/shadowfetch/buzz/.env",
-            unit,
-        )
 
-    def test_buzz_upstream_contract_is_locked(self):
-        lock = json.loads((ROOT / "qa/2.1.5/upstream-buzz.json").read_text())
-        self.assertEqual("desktop-v0.5.17", lock["tag"])
-        self.assertRegex(lock["commit"], r"^[0-9a-f]{40}$")
-        self.assertEqual("buzz", lock["debian_contract"]["package"])
-        self.assertEqual("0.5.17", lock["debian_contract"]["version"])
-        self.assertEqual("amd64", lock["debian_contract"]["architecture"])
-        self.assertIn("mesh-llm", lock["release_build"]["linux_features"])
-        self.assertEqual("0.2.1", lock["relay"]["tag"])
-        self.assertRegex(lock["relay"]["commit"], r"^[0-9a-f]{40}$")
-        self.assertRegex(lock["relay"]["manifest_sha256"], r"^[0-9a-f]{64}$")
-        self.assertRegex(lock["relay"]["amd64_image_sha256"], r"^[0-9a-f]{64}$")
-        for binary in ("/usr/bin/buzz", "/usr/bin/buzz-agent", "/usr/bin/buzz-desktop"):
-            self.assertIn(binary, lock["debian_contract"]["required_binaries"])
-
-    def test_codex_upstream_contract_is_locked(self):
-        lock = json.loads((ROOT / "qa/3.5.0/upstream-codex.json").read_text())
-        helper = CODEX.read_text()
-        self.assertEqual("0.150.1", lock["release"])
-        self.assertEqual(
-            "https://learn.chatgpt.com/docs/codex/cli", lock["documentation"]
-        )
-        self.assertEqual(
-            "https://chatgpt.com/codex/install.sh", lock["installer"]["url"]
-        )
-        self.assertRegex(lock["installer"]["sha256"], r"^[0-9a-f]{64}$")
-        self.assertEqual("desktop-user", lock["installation"]["scope"])
-        self.assertFalse(lock["installation"]["credentials_embedded"])
-        self.assertTrue(
-            lock["installation"]["archive_digest_verified_by_upstream_installer"]
-        )
-        self.assertIn(f'CODEX_VERSION="{lock["release"]}"', helper)
-        self.assertIn(f'INSTALLER_URL="{lock["installer"]["url"]}"', helper)
-        self.assertIn(f'INSTALLER_SHA256="{lock["installer"]["sha256"]}"', helper)
-
-    def test_codex_setup_is_opt_in_verified_and_user_owned(self):
-        helper = CODEX.read_text()
-        welcome = WELCOME.read_text()
-        install_manifest = (
-            DEFAULTS / "debian/shadowfetch-defaults.install"
-        ).read_text()
-        self.assertIn('"label": "OpenAI Codex CLI"', welcome)
-        self.assertIn("checkbox.setChecked(False)", welcome)
-        self.assertIn('"codex": coding_agents["codex"]', welcome)
-        self.assertIn('selected_agents = {"codex": bool(local_ai.get("codex"))}', welcome)
-        self.assertIn("Official Codex installer SHA-256 verified", helper)
-        self.assertIn("sha256sum --check --status", helper)
-        self.assertIn("--proto '=https'", helper)
-        self.assertIn("CODEX_NON_INTERACTIVE=true", helper)
-        self.assertIn("CODEX_INSTALLER_USE_RELEASES_OPENAI_COM=true", helper)
-        self.assertIn('if ((EUID == 0))', helper)
-        self.assertIn('BIN_DIR="${CODEX_INSTALL_DIR:-$HOME/.local/bin}"', helper)
-        self.assertIn("No OpenAI credential was stored by Shadowfetch", helper)
-        self.assertNotIn("OPENAI_API_KEY", helper)
-        self.assertNotIn("auth.json", helper)
-        self.assertNotRegex(helper, r"curl[^\n|]*\|\s*(?:ba)?sh\b")
-        self.assertIn("data/usr/bin/shadowfetch-codex", install_manifest)
-        self.assertIn("data/usr/share/doc/shadowfetch/CODEX.md", install_manifest)
-
-        next_body = welcome.split("def _start_next_ai(self):", 1)[1].split(
-            "\n    def ", 1
-        )[0]
-        self.assertLess(
-            next_body.index('self.buzz_state == "pending"'),
-            next_body.index("for agent in CODING_AGENTS"),
-        )
-
-    def test_additional_coding_agents_are_locked_and_user_owned(self):
-        lock = json.loads(
-            (ROOT / "qa/2.1.5/upstream-coding-agents.json").read_text()
-        )
-        helper = CODE_AGENTS.read_text()
-        expected = {
-            "claude": (
-                "2.1.227",
-                "https://downloads.claude.ai/claude-code-releases/2.1.227/linux-x64/claude",
-                "6832dc3f1797b890b71116e5f2dbbf9a83fd3d0498c235b4b0f9cd0e6e499ad6",
-                "claude",
-            ),
-            "grok": (
-                "1.0.5",
-                "https://x.ai/cli/grok-1.0.5-linux-x86_64",
-                "9ba87444e1819e8f6104adbbf4676a870c204380aa5c3e1c38a926c4ea677238",
-                "grok",
-            ),
-            "cursor": (
-                "2026.08.11-e8db854",
-                "https://downloads.cursor.com/lab/2026.08.11-e8db854/linux/x64/agent-cli-package.tar.gz",
-                "bfff4bf6f4e9dd30c1d0ef0a70b6077b074015dd2948e4c50685d53afdcfce5a",
-                "cursor-agent",
-            ),
-        }
-        self.assertEqual("linux-x86_64", lock["platform"])
-        self.assertEqual("desktop-user", lock["installation"]["scope"])
-        self.assertFalse(lock["installation"]["selected_by_default"])
-        self.assertFalse(lock["installation"]["credentials_embedded"])
-        self.assertFalse(lock["installation"]["credentials_copied_by_shadowfetch"])
-        self.assertFalse(lock["installation"]["failure_blocks_base_setup"])
-        for key, (release, url, digest, command) in expected.items():
-            agent = lock["agents"][key]
-            self.assertEqual(release, agent["release"])
-            self.assertEqual(url, agent["artifact"]["url"])
-            self.assertEqual(digest, agent["artifact"]["sha256"])
-            self.assertEqual(command, agent["command"])
-            self.assertIn(f'VERSION="{release}"', helper)
-            self.assertIn(f'ARTIFACT_URL="{url}"', helper)
-            self.assertIn(f'ARTIFACT_SHA256="{digest}"', helper)
+    def test_shadowcode_owns_the_vendor_clis_and_the_distro_helpers_are_gone(self):
+        """5.0: ShadowCode installs and connects Codex, Claude Code, Cursor and
+        Grok itself, so the distro's own installers are not shipped."""
+        install_manifest = (DEFAULTS / "debian/shadowfetch-defaults.install").read_text()
+        for name in ("shadowfetch-codex", "shadowfetch-code-agent", "CODEX.md", "CODING-AGENTS.md"):
+            self.assertNotIn(name, install_manifest)
+        self.assertFalse((DEFAULTS / "data/usr/bin/shadowfetch-codex").exists())
+        self.assertFalse((DEFAULTS / "data/usr/bin/shadowfetch-code-agent").exists())
 
     def test_coding_agent_choices_are_grouped_verified_and_independent(self):
-        helper = CODE_AGENTS.read_text()
         welcome = WELCOME.read_text()
-        install_manifest = (
-            DEFAULTS / "debian/shadowfetch-defaults.install"
-        ).read_text()
+        # 5.0 offers exactly three optional agents; ShadowCode connects the
+        # vendor coding CLIs.
         for label in (
-            "OpenAI Codex CLI",
-            "Anthropic Claude Code",
-            "xAI Grok Build",
-            "Cursor Agent",
+            "Grok Bot · official native desktop",
+            "Hermes Agent · Nous Research",
+            "OpenClaw · personal AI agent",
         ):
             self.assertIn(label, welcome)
-        self.assertIn("Optional coding agents", welcome)
-        self.assertIn("Select all four", welcome)
-        self.assertIn("QGridLayout", welcome)
-        self.assertIn("agent_grid.addWidget(card, index // 2, index % 2)", welcome)
+        for label in ("OpenAI Codex CLI", "Anthropic Claude Code", "xAI Grok Build", "Cursor Agent"):
+            self.assertNotIn(label, welcome)
+        self.assertIn("Optional agents", welcome)
+        self.assertIn("Select all three", welcome)
         self.assertIn("checkbox.setChecked(False)", welcome)
         self.assertIn('"coding_agents": coding_agents', welcome)
         self.assertIn("for agent in CODING_AGENTS", welcome)
         self.assertIn('command.extend(["setup", "--yes", "--no-open"])', welcome)
-        self.assertIn("sha256sum --check --status", helper)
-        self.assertIn("--proto '=https'", helper)
-        self.assertIn('if ((EUID == 0))', helper)
-        self.assertIn('BIN_DIR="${SHADOWFETCH_CODE_AGENT_BIN_DIR:-$HOME/.local/bin}"', helper)
-        self.assertIn("credentials_stored_by_shadowfetch=false", helper)
-        self.assertNotIn("API_KEY", helper)
-        self.assertNotIn("auth.json", helper)
-        self.assertNotRegex(helper, r"curl[^\n|]*\|\s*(?:ba)?sh\b")
-        self.assertNotIn('"$BIN_DIR/agent"', helper)
-        self.assertIn("data/usr/bin/shadowfetch-code-agent", install_manifest)
-        self.assertIn("data/usr/share/doc/shadowfetch/CODING-AGENTS.md", install_manifest)
 
     def test_nvidia_rtx_5080_contract_is_locked(self):
         lock = json.loads((ROOT / "qa/2.1.5/upstream-nvidia.json").read_text())
@@ -454,80 +343,6 @@ class FireEdition215Tests(unittest.TestCase):
             self.assertIn("deb-systemd-helper", script)
             self.assertNotRegex(script, r"(?m)^\s*systemctl\b")
 
-    def test_buzz_relay_is_loopback_only_and_image_is_pinned(self):
-        compose = BUZZ_COMPOSE.read_text()
-        helper = BUZZ.read_text()
-        lock = json.loads((ROOT / "qa/2.1.5/upstream-buzz.json").read_text())
-        self.assertIn('"127.0.0.1:${BUZZ_HTTP_PORT:-3000}:3000"', compose)
-        self.assertNotIn('"${BUZZ_HTTP_PORT:-3000}:3000"', compose)
-        self.assertRegex(
-            helper,
-            r'BUZZ_IMAGE="ghcr\.io/block/buzz@sha256:[0-9a-f]{64}"',
-        )
-        self.assertIn(
-            f'BUZZ_IMAGE="ghcr.io/block/buzz@sha256:{lock["relay"]["manifest_sha256"]}"',
-            helper,
-        )
-        self.assertIn(
-            'BUZZ_CORS_ORIGINS "tauri://localhost,http://tauri.localhost,'
-            'http://127.0.0.1:3000"',
-            helper,
-        )
-        self.assertRegex(
-            helper,
-            r'set_env_value "\$env_file" BUZZ_REQUIRE_AUTH_TOKEN false',
-        )
-        self.assertRegex(
-            helper,
-            r'set_env_value "\$env_file" BUZZ_REQUIRE_RELAY_MEMBERSHIP false',
-        )
-        self.assertIn('export BUZZ_RELAY_URL="$RELAY_URL"', helper)
-        self.assertNotRegex(helper, r"(?m)^\s*(?:source|\.)\s+.*client\.env")
-
-    def test_buzz_wayland_launch_uses_guarded_webkit_renderer(self):
-        helper = BUZZ.read_text()
-        self.assertIn("prepare_buzz_rendering()", helper)
-        self.assertIn('[[ -n "${WAYLAND_DISPLAY:-}"', helper)
-        self.assertIn('-z "${WEBKIT_DMABUF_RENDERER_FORCE_SHM+x}"', helper)
-        self.assertIn('-z "${WEBKIT_DISABLE_DMABUF_RENDERER+x}"', helper)
-        self.assertIn("export WEBKIT_DMABUF_RENDERER_FORCE_SHM=1", helper)
-        self.assertNotIn("export WEBKIT_DISABLE_DMABUF_RENDERER=1", helper)
-        open_body = helper.split("cmd_open() {", 1)[1].split("\n}", 1)[0]
-        self.assertLess(
-            open_body.index("prepare_buzz_rendering"),
-            open_body.index("exec buzz-desktop"),
-        )
-
-    def test_every_container_image_is_immutable(self):
-        image_lines = [
-            line.strip()
-            for line in BUZZ_COMPOSE.read_text().splitlines()
-            if line.strip().startswith("image:")
-        ]
-        self.assertEqual(5, len(image_lines))
-        for line in image_lines:
-            if "${BUZZ_IMAGE}" in line:
-                continue
-            self.assertRegex(line, r"@sha256:[0-9a-f]{64}$")
-
-    def test_buzz_package_is_checksum_and_transaction_gated(self):
-        provision = PROVISION.read_text()
-        lock = json.loads((ROOT / "qa/2.1.5/upstream-buzz.json").read_text())
-        digest = lock["asset"]["sha256"]
-        self.assertIn(f'BUZZ_DEB_SHA256="{digest}"', provision)
-        self.assertIn("--proto '=https'", provision)
-        self.assertIn("dpkg --audit", provision)
-        self.assertIn("dpkg --compare-versions", provision)
-        verify_at = provision.index("sha256sum --check --status")
-        simulate_at = provision.index('-s install "$deb"')
-        apply_at = provision.index('--no-remove install -y "$deb"')
-        self.assertLess(verify_at, simulate_at)
-        self.assertLess(simulate_at, apply_at)
-        self.assertIn("grep -q '^Remv '", provision)
-        self.assertIn("trap cleanup EXIT", provision)
-        self.assertIn("trap - EXIT", provision)
-        self.assertNotRegex(provision, r"trap\s+['\"]")
-        self.assertNotRegex(provision, r"curl[^\n|]*\|\s*(?:ba)?sh\b")
 
     def test_live_user_cleanup_requires_a_nonempty_account_name(self):
         cleanup = (
@@ -540,26 +355,31 @@ class FireEdition215Tests(unittest.TestCase):
         self.assertNotIn('rm -rf "/home/$USER"', cleanup)
         self.assertIn('grep -q "^${LIVE_USER}:" /etc/shadow', cleanup)
 
-    def test_installed_manifest_has_buzz_and_no_retired_launchers(self):
+    def test_installed_manifest_keeps_workspaces_and_no_retired_launchers(self):
         manifest = (DEFAULTS / "debian/shadowfetch-defaults.install").read_text()
         for expected in (
-            "data/usr/bin/shadowfetch-buzz",
-            "data/usr/libexec/shadowfetch-buzz-bootstrap",
-            "data/usr/libexec/shadowfetch-buzz-provision",
-            "data/usr/libexec/shadowfetch-buzz-stack",
             "data/usr/libexec/shadowfetch-migrate-2.1.3-ai",
-            "data/usr/share/shadowfetch/buzz/compose.yml",
-            "data/usr/lib/systemd/user/shadowfetch-buzz.service",
             "data/usr/lib/systemd/system/shadowfetch-migrate-2.1.3-ai.service",
             "data/usr/share/shadowfetch/migrations/2.1.3-ai-packages",
-            "data/usr/share/doc/shadowfetch/BUZZ.md",
             "data/usr/bin/shadowfetch-passport",
         ):
             self.assertIn(expected, manifest)
         self.assertNotRegex(
             manifest,
-            re.compile(r"openclaw|hermes|shadowfetch-(?:assistant|llm|ai)(?:\s|\.)", re.I),
+            re.compile(r"shadowfetch-(?:assistant|llm|ai)(?:\s|\.)", re.I),
         )
+        # Hermes/OpenClaw ship ONLY as their optional-install helpers and the
+        # OpenClaw lockfile; never as a runtime, service or launcher.
+        optional = [line.split()[0] for line in manifest.splitlines()
+                    if re.search(r"openclaw|hermes", line, re.I)]
+        self.assertEqual(sorted(optional), sorted([
+            "data/usr/bin/shadowfetch-hermes",
+            "data/usr/bin/shadowfetch-openclaw",
+            "data/usr/share/doc/shadowfetch/HERMES.md",
+            "data/usr/share/doc/shadowfetch/OPENCLAW.md",
+            "data/usr/share/shadowfetch/openclaw/2026.9.6/package.json",
+            "data/usr/share/shadowfetch/openclaw/2026.9.6/package-lock.json",
+        ]))
         self.assertNotIn("80shadowfetch-snapshot", manifest)
         self.assertNotIn("apt-snapshot.sh", manifest)
         self.assertFalse(
@@ -581,7 +401,6 @@ class FireEdition215Tests(unittest.TestCase):
             "pkexec",
             "polkitd",
             "podman",
-            "podman-compose",
             "psmisc",
             "sudo",
             "vulkan-tools",
@@ -703,22 +522,8 @@ class FireEdition215Tests(unittest.TestCase):
                             installed_sources,
                             f"unused launcher: {source}",
                         )
-        self.assertIn("usr/share/applications/shadowfetch-local-ai.desktop", owners)
-        self.assertIn("usr/share/applications/shadowfetch-buzz.desktop", owners)
+        self.assertIn("usr/share/applications/shadowfetch-agent-workspace.desktop", owners)
 
-    def test_local_ai_launchers_have_one_predictable_menu(self):
-        menu = (
-            ROOT
-            / "packages/shadowfetch-menus/etc/xdg/menus/applications-merged/"
-            "shadowfetch-launcher.menu"
-        ).read_text()
-        self.assertGreaterEqual(
-            menu.count("<Not><Category>X-Shadowfetch-AI</Category></Not>"),
-            2,
-        )
-        self.assertIn("<Filename>shadowfetch-local-ai.desktop</Filename>", menu)
-        self.assertIn("<Directory>shadowfetch-local-ai.directory</Directory>", menu)
-        self.assertNotIn("shadowfetch-ai.directory", menu)
 
     def test_welcome_catalog_has_no_model_download_records(self):
         catalog = (
@@ -730,34 +535,16 @@ class FireEdition215Tests(unittest.TestCase):
         self.assertNotIn("model", {record["kind"] for record in records})
         self.assertEqual([], list(catalog.glob("model-*.json")))
         readme = (catalog / "README").read_text()
-        self.assertIn("Buzz's native Compute workflow", readme)
+        self.assertNotIn("Buzz's native Compute workflow", readme)
         self.assertNotIn("shadowfetch-ai", readme)
 
-    def test_buzz_is_the_only_model_owner_in_current_guidance(self):
-        welcome = WELCOME.read_text()
-        guide = (DEFAULTS / "data/usr/share/doc/shadowfetch/BUZZ.md").read_text()
-        release = (ROOT / "docs/RELEASE-2.1.5.md").read_text()
-        for content in (welcome, guide, release, BUZZ.read_text()):
-            self.assertIn("Buzz", content)
-            self.assertNotRegex(
-                content,
-                re.compile(r"\bollama\b|ministral|open[- ]?webui", re.I),
-            )
-        self.assertIn("Settings > Compute", guide)
-        self.assertIn("Settings > Compute", BUZZ.read_text())
-        self.assertNotIn("--model", BUZZ.read_text())
 
     def test_shipped_programs_and_build_hooks_are_executable(self):
         paths = (
-            BUZZ,
-            PROVISION,
-            BUZZ_STACK,
             MIGRATION_HELPER,
             DEFAULTS / "data/usr/bin/shadowfetch-gpu",
             DEFAULTS / "data/usr/bin/shadowfetch-update",
             DEFAULTS / "data/usr/bin/shadowfetch-agent-workspace",
-            DEFAULTS / "data/usr/bin/shadowfetch-agent-doctor",
-            DEFAULTS / "data/usr/bin/shadowfetch-agent-tools",
             PASSPORT,
             ROOT / "live-build/config/hooks/0020-gpu-firstboot.hook.chroot",
             WELCOME,
@@ -767,14 +554,9 @@ class FireEdition215Tests(unittest.TestCase):
 
     def test_shell_and_python_entrypoints_parse(self):
         shell_files = [
-            BUZZ,
-            PROVISION,
-            BUZZ_STACK,
             MIGRATION_HELPER,
             DEFAULTS / "data/usr/bin/shadowfetch-gpu",
             DEFAULTS / "data/usr/bin/shadowfetch-update",
-            DEFAULTS / "data/usr/bin/shadowfetch-agent-doctor",
-            DEFAULTS / "data/usr/bin/shadowfetch-agent-tools",
             DEFAULTS / "data/usr/bin/shadowfetch-agent-workspace",
         ]
         for path in shell_files:
@@ -788,8 +570,11 @@ class FireEdition215Tests(unittest.TestCase):
             DEFAULTS / "data/usr/bin/shadowfetch-facts",
             PASSPORT,
             CONTROL / "usr/share/shadowfetch/control-center/sfcc/app.py",
+            CONTROL / "usr/share/shadowfetch/control-center/sfcc/pages.py",
             CONTROL / "usr/share/shadowfetch/control-center/sfcc/guide_page.py",
-            CONTROL / "usr/share/shadowfetch/control-center/sfcc/agents_page.py",
+            # agents_page.py became workspaces_page.py; `agents` is still an
+            # accepted route word, which is the part a person could notice.
+            CONTROL / "usr/share/shadowfetch/control-center/sfcc/workspaces_page.py",
             CONTROL / "usr/share/shadowfetch/control-center/sfcc/firewatch_page.py",
         )
         with tempfile.TemporaryDirectory() as temporary:
@@ -958,26 +743,8 @@ class FireEdition215Tests(unittest.TestCase):
         self.assertIn("drivers", routes)
         self.assertIn("software", routes)
 
-    def test_system_passport_formats_hardware_notes_as_sentences(self):
-        module = self._passport_module("sf_passport_hardware_notes_qa")
-        check = module._local_ai_check({
-            "gpus": [{"flags": []}],
-            "verdict": {
-                "sentence": "7B models run, but slowly and with a small context.",
-                "suffixes": [
-                    "slower processor — expect well below typical speeds",
-                    "no AVX2 — CPU inference will be slower",
-                ],
-            },
-        })
-        self.assertEqual(
-            "7B models run, but slowly and with a small context. "
-            "Slower processor — expect well below typical speeds. "
-            "No AVX2 — CPU inference will be slower.",
-            check["summary"],
-        )
 
-    def test_guide_is_first_and_live_setup_exposes_the_passport(self):
+    def test_missions_are_first_and_live_setup_keeps_the_passport(self):
         app = (
             CONTROL / "usr/share/shadowfetch/control-center/sfcc/app.py"
         ).read_text()
@@ -989,9 +756,17 @@ class FireEdition215Tests(unittest.TestCase):
             ROOT / "packages/shadowfetch-control-center/debian/"
             "shadowfetch-control-center.install"
         ).read_text()
-        self.assertRegex(app, r"SECTIONS\s*=\s*\[\s*\(\"guide\"")
-        self.assertIn('"passport": "guide"', app)
-        self.assertIn("GuidePage(self.open_route)", app)
+        # Order, routing and construction all moved into the one registry.
+        # app.py reads it (`SECTIONS = pages.REGISTRY`) and holds no list, no
+        # alias map and no page constructor of its own -- which is the point of
+        # W-31, so asserting them here would be asserting the old shape back.
+        registry = (
+            CONTROL / "usr/share/shadowfetch/control-center/sfcc/pages.py"
+        ).read_text()
+        self.assertIn("SECTIONS = pages.REGISTRY", app)
+        self.assertRegex(registry, r"REGISTRY[^(]*\(\s*\n\s*Section\(\"missions\"")
+        self.assertIn('"passport"', registry)
+        self.assertIn("GuidePage", registry)
         self.assertIn("shadowfetch-passport", guide)
         self.assertIn("Nothing is uploaded", guide)
         self.assertGreaterEqual(welcome.count("Check this computer"), 2)
@@ -1040,7 +815,7 @@ class FireEdition215Tests(unittest.TestCase):
             }})
             assert page.state.text() == "Ready with notes"
             style = page.state.styleSheet()
-            assert "background: #d8a24a" in style
+            assert "background: #f2b33d" in style
             assert "color: #151515" in style
             page.show()
             app.processEvents()
@@ -1107,31 +882,33 @@ class FireEdition215Tests(unittest.TestCase):
             app = module.QApplication([])
 
             submitted = []
-            choice = module.BuzzPage(submitted.append)
-            assert tuple(choice.coding_agents) == ("codex", "claude", "grok", "cursor")
+            recorded = []
+            module.desktop.agent_network = lambda: "online"
+            module.desktop.set_agent_network = recorded.append
+            choice = module.AgentSetupPage(submitted.append)
+            assert tuple(choice.coding_agents) == ("grok-bot", "hermes", "openclaw")
             assert not any(box.isChecked() for box in choice.coding_agents.values())
             choice.select_all_agents.setChecked(True)
             assert all(box.isChecked() for box in choice.coding_agents.values())
-            choice.coding_agents["grok"].setChecked(False)
+            choice.coding_agents["hermes"].setChecked(False)
             assert not choice.select_all_agents.isChecked()
             choice._submit()
             assert submitted[-1]["coding_agents"] == {{
-                "codex": True, "claude": True, "grok": False, "cursor": True,
+                "grok-bot": True, "hermes": False, "openclaw": True,
             }}
+            assert recorded == ["online"]
 
-            install = module.InstallPage(lambda: None)
-            install.buzz_state = "not-requested"
+            install = module.InstallPage(lambda _agents: None)
             install.coding_agent_states = {{
-                "codex": "failed", "claude": "pending",
-                "grok": "pending", "cursor": "pending",
+                "grok-bot": "failed", "hermes": "pending", "openclaw": "pending",
             }}
             started = []
             install._start_coding_agent_setup = lambda agent: started.append(agent["key"])
             install._start_next_ai()
-            assert started == ["claude"]
-            install.coding_agent_states["claude"] = "failed"
+            assert started == ["hermes"]
+            install.coding_agent_states["hermes"] = "failed"
             install._start_next_ai()
-            assert started == ["claude", "grok"]
+            assert started == ["hermes", "openclaw"]
             """
         )
         env = os.environ.copy()
@@ -1150,12 +927,8 @@ class FireEdition215Tests(unittest.TestCase):
 
     def test_help_paths_are_read_only(self):
         paths = (
-            BUZZ,
-            PROVISION,
             DEFAULTS / "data/usr/bin/shadowfetch-gpu",
             DEFAULTS / "data/usr/bin/shadowfetch-agent-workspace",
-            DEFAULTS / "data/usr/bin/shadowfetch-agent-doctor",
-            DEFAULTS / "data/usr/bin/shadowfetch-agent-tools",
         )
         for path in paths:
             result = subprocess.run(
@@ -1167,102 +940,6 @@ class FireEdition215Tests(unittest.TestCase):
             self.assertEqual(0, result.returncode, f"{path}: {result.stderr}")
             self.assertIn("USAGE", result.stdout, path)
 
-    def test_buzz_service_uses_ordered_readiness_helper(self):
-        unit = (
-            DEFAULTS / "data/usr/lib/systemd/user/shadowfetch-buzz.service"
-        ).read_text()
-        helper = BUZZ_STACK.read_text()
-        compose = BUZZ_COMPOSE.read_text()
-        self.assertIn("ExecStart=/usr/libexec/shadowfetch-buzz-stack start", unit)
-        self.assertIn("/_readiness", helper)
-        self.assertIn('run --rm minio-init', helper)
-        self.assertIn("TimeoutStartSec=1800", unit)
-        self.assertIn("restart shadowfetch-buzz.service", BUZZ.read_text())
-        relay = compose.split("  relay:", 1)[1].split("  postgres:", 1)[0]
-        self.assertNotIn("minio-init", relay)
-
-    @unittest.skipUnless(Path("/usr/bin/flock").exists(), "Linux lock test")
-    def test_buzz_stack_lock_is_not_inherited_by_service_children(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            fake = root / "bin"
-            fake.mkdir()
-            child_pid = root / "child.pid"
-            self._write_executable(
-                fake / "podman-compose",
-                f"""
-                sleep 5 >/dev/null 2>&1 &
-                printf '%s\\n' "$!" > {child_pid!s}
-                """,
-            )
-            (root / "compose.yml").write_text("services: {}\n")
-            env_file = root / ".env"
-            env_file.write_text("BUZZ_HTTP_PORT=3000\n")
-            env_file.chmod(0o600)
-            env = os.environ.copy()
-            env.update({
-                "HOME": str(root / "home"),
-                "XDG_RUNTIME_DIR": str(root / "run"),
-                "PATH": f"{fake}:/usr/bin:/bin",
-                "SHADOWFETCH_BUZZ_PROJECT": "qa-lock",
-                "SHADOWFETCH_BUZZ_COMPOSE_FILE": "compose.yml",
-                "SHADOWFETCH_BUZZ_ENV_FILE": ".env",
-            })
-            (root / "home").mkdir()
-            try:
-                first = subprocess.run(
-                    [str(BUZZ_STACK), "stop"],
-                    cwd=root,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                second = subprocess.run(
-                    [str(BUZZ_STACK), "stop"],
-                    cwd=root,
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                self.assertEqual(0, first.returncode, first.stderr)
-                self.assertEqual(0, second.returncode, second.stderr)
-            finally:
-                if child_pid.exists():
-                    os.kill(int(child_pid.read_text().strip()), 9)
-
-    def test_welcome_uses_one_buzz_native_choice(self):
-        welcome = WELCOME.read_text()
-        buzz_page = welcome.split("class BuzzPage", 1)[1].split(
-            "class InstallPage", 1
-        )[0]
-        self.assertIn('("install-buzz", "Install Buzz"', buzz_page)
-        self.assertIn('("none", "Not now"', buzz_page)
-        self.assertNotIn("QComboBox", welcome)
-        self.assertNotIn("Buzz plus model", welcome)
-        self.assertIn("ranks open-source models", buzz_page)
-
-    def test_first_run_completion_waits_for_buzz_or_explicit_skip(self):
-        welcome = WELCOME.read_text()
-        install = welcome.split("class InstallPage", 1)[1].split(
-            "class ShadowfetchWelcome", 1
-        )[0]
-        self.assertIn('[helper, "setup", "--yes", "--no-open"]', install)
-        self.assertIn('self.buzz_state = "ready"', install)
-        finish = install.split("    def _finish(self):", 1)[1].split(
-            "    def _skip_buzz", 1
-        )[0]
-        self.assertLess(
-            finish.index('if self.buzz_state == "failed"'),
-            finish.index("WELCOME_DONE_FLAG.touch()"),
-        )
-        self.assertLess(
-            finish.index("if self.busy"),
-            finish.index("WELCOME_DONE_FLAG.touch()"),
-        )
-        skip = install.split("    def _skip_buzz", 1)[1]
-        self.assertIn("WELCOME_DONE_FLAG.touch()", skip)
 
     def test_welcome_cancellation_escalates_without_blocking_the_ui(self):
         welcome = WELCOME.read_text()
@@ -1284,7 +961,7 @@ class FireEdition215Tests(unittest.TestCase):
                 self.assertIn(expected, content)
         self.assertNotIn("subprocess.run", command_worker)
         self.assertIn(
-            'for name in ("coding_agent_worker", "buzz_worker", "worker")', welcome
+            'for name in ("coding_agent_worker", "worker")', welcome
         )
         self.assertIn("worker.cancel()", welcome)
         self.assertIn("Setup is still running", welcome)
@@ -1293,188 +970,12 @@ class FireEdition215Tests(unittest.TestCase):
 
     def test_user_workspace_helpers_reject_unsafe_invocation(self):
         workspace = (DEFAULTS / "data/usr/bin/shadowfetch-agent-workspace").read_text()
-        doctor = (DEFAULTS / "data/usr/bin/shadowfetch-agent-doctor").read_text()
-        tools = (DEFAULTS / "data/usr/bin/shadowfetch-agent-tools").read_text()
         self.assertIn("EUID != 0", workspace)
         self.assertIn('[[ "$ROOT" != / ]]', workspace)
         self.assertIn("realpath -m", workspace)
-        self.assertGreaterEqual(workspace.count('"$safe" != ..'), 2)
+        self.assertGreaterEqual(workspace.count('"$safe" != ..'), 1)
         self.assertIn('"$name" != ..', workspace)
-        for content in (doctor, tools):
-            self.assertIn('Unknown option: $1', content)
 
-    def test_buzz_service_start_failure_prints_diagnostics(self):
-        buzz = BUZZ.read_text()
-        start = buzz.split("start_relay()", 1)[1].split("cmd_setup()", 1)[0]
-        self.assertIn("ensure_user_service_bus", start)
-        self.assertIn("if ! systemctl --user restart", start)
-        self.assertIn("systemctl --user --no-pager status", start)
-        self.assertIn("journalctl --user -u shadowfetch-buzz.service", start)
-
-    def test_buzz_setup_recovers_the_desktop_user_bus_for_terminal_launches(self):
-        buzz = BUZZ.read_text()
-        helper = buzz.split("ensure_user_service_bus()", 1)[1].split(
-            "relay_ready()", 1
-        )[0]
-        self.assertIn('runtime_dir="/run/user/$(id -u)"', helper)
-        self.assertIn("export XDG_RUNTIME_DIR", helper)
-        self.assertIn("DBUS_SESSION_BUS_ADDRESS", helper)
-        self.assertIn('unix:path=${XDG_RUNTIME_DIR}/bus', helper)
-
-    def test_buzz_first_owner_bootstrap_is_scoped_and_secret_free(self):
-        bootstrap = BUZZ_BOOTSTRAP.read_text()
-        launcher = BUZZ.read_text()
-        self.assertIn("c.host='$COMMUNITY_HOST' AND e.kind=9007", bootstrap)
-        self.assertIn("((${#candidates[@]} != 1))", bootstrap)
-        self.assertIn("buzz-admin add-member", bootstrap)
-        self.assertIn('--pubkey "$candidate" --role admin', bootstrap)
-        self.assertIn("if ((member_count > 0))", bootstrap)
-        self.assertIn("com.docker.compose.project=$PROJECT", bootstrap)
-        self.assertIn("com.docker.compose.service=$service", bootstrap)
-        self.assertRegex(bootstrap, r"\^127\\\.0\\\.0\\\.1:")
-        self.assertNotRegex(
-            bootstrap,
-            re.compile(r"private[_ -]?key|generate-key|\bnsec\b", re.I),
-        )
-        self.assertIn("prepare_first_owner", launcher)
-        self.assertIn('printf \'%s\' "$RELAY_URL"', launcher)
-        self.assertIn('"$OWNER_BOOTSTRAP"', launcher)
-
-    @unittest.skipUnless(Path("/usr/bin/flock").exists(), "Linux bootstrap test")
-    def test_buzz_first_owner_bootstrap_enrols_one_candidate_only(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            fake = root / "bin"
-            fake.mkdir()
-            member = root / "member"
-            call = root / "add-member-call"
-            self._write_executable(
-                fake / "podman",
-                """
-                command=$1
-                shift
-                case "$command" in
-                    ps)
-                        case " $* " in
-                            *"service=relay"*) printf 'qa-relay\\n' ;;
-                            *"service=postgres"*) printf 'qa-postgres\\n' ;;
-                        esac
-                        ;;
-                    exec)
-                        if [ "${1:-}" = "-u" ]; then shift 2; fi
-                        container=$1
-                        shift
-                        case "${1:-}" in
-                            psql)
-                                case " $* " in
-                                    *"SELECT count(*)"*)
-                                        if [ -e "$TEST_MEMBER_FILE" ]; then
-                                            printf '1\\n'
-                                        else
-                                            printf '0\\n'
-                                        fi
-                                        ;;
-                                    *"e.kind=9007"*) printf '%s\\n' "$TEST_CANDIDATES" ;;
-                                esac
-                                ;;
-                            buzz-admin)
-                                shift
-                                printf '%s\\n' "$*" > "$TEST_CALL_FILE"
-                                touch "$TEST_MEMBER_FILE"
-                                ;;
-                        esac
-                        ;;
-                esac
-                """,
-            )
-            state = root / "state"
-            candidate = "ab" * 32
-            env = os.environ.copy()
-            env.update({
-                "HOME": str(root / "home"),
-                "PATH": f"{fake}:/usr/bin:/bin",
-                "SHADOWFETCH_BUZZ_STATE_DIR": str(state),
-                "SHADOWFETCH_BUZZ_BOOTSTRAP_ATTEMPTS": "1",
-                "SHADOWFETCH_BUZZ_BOOTSTRAP_INTERVAL": "0",
-                "TEST_MEMBER_FILE": str(member),
-                "TEST_CALL_FILE": str(call),
-                "TEST_CANDIDATES": candidate,
-            })
-            (root / "home").mkdir()
-            result = subprocess.run(
-                [str(BUZZ_BOOTSTRAP)],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            self.assertEqual(0, result.returncode, result.stderr)
-            self.assertEqual(
-                f"add-member --pubkey {candidate} --role admin",
-                call.read_text().strip(),
-            )
-            self.assertTrue((state / "local-owner-enrolled").is_file())
-
-    @unittest.skipUnless(Path("/usr/bin/flock").exists(), "Linux bootstrap test")
-    def test_buzz_first_owner_bootstrap_refuses_ambiguous_candidates(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            fake = root / "bin"
-            fake.mkdir()
-            member = root / "member"
-            call = root / "add-member-call"
-            self._write_executable(
-                fake / "podman",
-                """
-                command=$1
-                shift
-                case "$command" in
-                    ps)
-                        case " $* " in
-                            *"service=relay"*) printf 'qa-relay\\n' ;;
-                            *"service=postgres"*) printf 'qa-postgres\\n' ;;
-                        esac
-                        ;;
-                    exec)
-                        if [ "${1:-}" = "-u" ]; then shift 2; fi
-                        shift
-                        case "${1:-}" in
-                            psql)
-                                case " $* " in
-                                    *"SELECT count(*)"*) printf '0\\n' ;;
-                                    *"e.kind=9007"*) printf '%s\\n' "$TEST_CANDIDATES" ;;
-                                esac
-                                ;;
-                            buzz-admin) touch "$TEST_CALL_FILE" ;;
-                        esac
-                        ;;
-                esac
-                """,
-            )
-            state = root / "state"
-            env = os.environ.copy()
-            env.update({
-                "HOME": str(root / "home"),
-                "PATH": f"{fake}:/usr/bin:/bin",
-                "SHADOWFETCH_BUZZ_STATE_DIR": str(state),
-                "SHADOWFETCH_BUZZ_BOOTSTRAP_ATTEMPTS": "1",
-                "SHADOWFETCH_BUZZ_BOOTSTRAP_INTERVAL": "0",
-                "TEST_MEMBER_FILE": str(member),
-                "TEST_CALL_FILE": str(call),
-                "TEST_CANDIDATES": f"{'ab' * 32}\n{'cd' * 32}",
-            })
-            (root / "home").mkdir()
-            result = subprocess.run(
-                [str(BUZZ_BOOTSTRAP)],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            self.assertEqual(4, result.returncode)
-            self.assertIn("multiple first-owner candidates", result.stderr)
-            self.assertFalse(call.exists())
-            self.assertFalse((state / "local-owner-enrolled").exists())
 
     def test_no_shipped_helper_uses_an_unverified_pipe_installer(self):
         for directory in (DEFAULTS / "data/usr/bin", DEFAULTS / "data/usr/libexec"):
@@ -1518,29 +1019,64 @@ class FireEdition215Tests(unittest.TestCase):
             r"recommended.*\^\(nvidia-open\|cuda-drivers\)",
         )
 
-    def test_update_simulates_twice_and_refuses_unverified_removals(self):
+    def test_update_is_a_thin_shim_over_fireproof(self):
+        """shadowfetch-update is a compatibility SURFACE, not an updater.
+
+        It used to be a second complete updater: its own `apt-get update`,
+        its own `apt-get -s full-upgrade`, its own two-entry removal
+        allowlist, its own sha256 plan fingerprint, and its own copy of
+        snapper_max_number / snapper_first_pre_after / phoenix_available.
+        It also relabelled the same snapper Point Fireproof labels - with a
+        different description and no fireproof=pre userdata - and then
+        recorded that Point NOWHERE, so a later `fireproof rollback` would
+        have restored the PREVIOUS transaction's state.
+
+        The mechanism now lives once, in fireproofd. What this file must
+        still do is translate the old command line and get out of the way.
+        """
         update = (DEFAULTS / "data/usr/bin/shadowfetch-update").read_text()
-        self.assertIn("apt-get -s", update)
-        self.assertIn("/^Remv /", update)
-        self.assertIn("validate_removals", update)
-        self.assertIn("plan_fingerprint", update)
-        self.assertIn("will not apply unverified package removals", update)
-        self.assertIn("libprocesscore10", update)
-        self.assertIn("libprocesscore11", update)
-        self.assertIn("qml6-module-org-kde-milou", update)
-        self.assertIn("transaction=(--no-remove full-upgrade)", update)
-        self.assertIn("flock -n", update)
-        self.assertIn("80snapper", update)
-        self.assertIn("write_snapper_rows", update)
-        self.assertIn("snapper_first_pre_after", update)
-        self.assertRegex(
-            update,
-            re.compile(r"load_migration_plan\(\).*?\n    return 0\n}", re.S),
-        )
-        self.assertNotRegex(update, r"\$\([^)]*snapper_rows")
-        self.assertNotRegex(update, r"snapper[^\n]*create")
-        self.assertIn("trap cleanup EXIT", update)
-        self.assertNotRegex(update, r"trap\s+['\"]")
+        body = "\n".join(
+            line for line in update.split("SFHELP", 2)[0].splitlines()
+            if not line.lstrip().startswith("#"))
+        self.assertIn("FIREPROOF=/usr/bin/fireproof", body)
+        self.assertIn('exec "$FIREPROOF" "$verb"', update)
+        for gone in ("apt-get", "snapper", "sudo ", "flock", "sha256sum",
+                     "validate_removals", "plan_fingerprint",
+                     "libprocesscore10", "qml6-module-org-kde-milou",
+                     "load_migration_plan"):
+            self.assertNotIn(gone, body, gone)
+        self.assertLess(len(update.splitlines()), 150)
+
+    def test_update_maps_the_legacy_options_onto_the_one_vocabulary(self):
+        update = (DEFAULTS / "data/usr/bin/shadowfetch-update").read_text()
+        for option, verb in (("--check", "check"), ("--verify", "verify"),
+                             ("--rollback", "rollback")):
+            self.assertRegex(update, re.escape(option) + r"\)\s*verb=" + verb)
+        self.assertRegex(update, r'""\)\s*verb=update')
+        for step in ("simulate", "approve", "commit", "verify", "rollback"):
+            self.assertIn(step, update)
+
+    def test_the_2_1_3_migration_still_has_an_owner(self):
+        """The retirement moved; it was not dropped.
+
+        shadowfetch-update used to fold the one-time 2.1.3 AI package
+        retirement into its transaction. That is now ONLY
+        shadowfetch-migrate-2.1.3-ai.service, gated on the same marker and
+        the same sha256-verified manifest. The behavioural difference is
+        real: the retirement completes at the next boot rather than inside
+        an interactive update.
+        """
+        unit = (DEFAULTS / "data/usr/lib/systemd/system"
+                / "shadowfetch-migrate-2.1.3-ai.service").read_text()
+        self.assertIn(
+            "ConditionPathExists=/var/lib/shadowfetch/migrations/"
+            "2.1.3-ai.pending", unit)
+        self.assertIn("ExecStart=/usr/libexec/shadowfetch-migrate-2.1.3-ai",
+                      unit)
+        self.assertIn("WantedBy=multi-user.target", unit)
+        helper = MIGRATION_HELPER.read_text()
+        self.assertIn("MANIFEST_SHA256=", helper)
+        self.assertIn("sha256sum --check --status", helper)
 
     def test_branding_refreshes_os_release_after_package_updates(self):
         branding = ROOT / "packages/shadowfetch-branding/debian"
@@ -1552,245 +1088,87 @@ class FireEdition215Tests(unittest.TestCase):
         self.assertIn("install -m 0644 \"$source\" /usr/lib/os-release", postinst)
         self.assertEqual("interest-noawait /usr/lib/os-release\n", triggers)
 
-    def test_health_checks_buzz_native_ports_only(self):
-        health = (DEFAULTS / "data/usr/bin/shadowfetch-health").read_text()
-        doctor = (DEFAULTS / "data/usr/bin/shadowfetch-agent-doctor").read_text()
-        for content in (health, doctor):
-            self.assertIn("9337", content)
-            self.assertIn("3000", content)
-            self.assertNotIn("11434", content)
-            self.assertNotRegex(content, re.compile(r"\bollama\b", re.I))
 
     @staticmethod
     def _write_executable(path: Path, body: str) -> None:
         path.write_text("#!/bin/sh\nset -eu\n" + textwrap.dedent(body))
         path.chmod(0o755)
 
-    def _buzz_failure_env(self, root: Path, listener_port=None, free=100000):
-        fake = root / "bin"
-        fake.mkdir()
-        marker = root / "provision-called"
-        compose = root / "compose.yml"
-        compose.write_text("services: {}\n")
-        self._write_executable(fake / "podman", "exit 0\n")
-        self._write_executable(fake / "podman-compose", "exit 0\n")
-        if listener_port is None:
-            self._write_executable(fake / "ss", "exit 0\n")
-        else:
-            self._write_executable(
-                fake / "ss",
-                f"printf 'LISTEN 0 128 127.0.0.1:{listener_port} 0.0.0.0:*\\n'\n",
-            )
-        self._write_executable(fake / "curl", "exit 22\n")
-        self._write_executable(
-            fake / "df",
-            f"""
-            printf 'Filesystem 1-blocks Used Available Capacity Mounted on\\n'
-            printf 'fake 100000000 99900000 {free} 99%% /\\n'
-            """,
-        )
-        self._write_executable(fake / "pkexec", f"touch {marker!s}\nexit 1\n")
-        home = root / "home"
-        home.mkdir()
-        env = os.environ.copy()
-        env.update({
-            "DISPLAY": ":1",
-            "HOME": str(home),
-            "XDG_RUNTIME_DIR": str(root / "run"),
-            "PATH": f"{fake}:/usr/bin:/bin",
-            "SHADOWFETCH_BUZZ_COMPOSE_SOURCE": str(compose),
-        })
-        return env, marker
 
-    @unittest.skipUnless(Path("/usr/bin/flock").exists(), "Linux failure-injection test")
-    def test_low_disk_fails_before_buzz_provisioning(self):
+    def test_update_runs_no_package_tooling_of_its_own(self):
+        """Booby-trapped PATH: the shim must touch none of it.
+
+        The old updater ran df, curl, upower, fuser, dpkg, apt-get, sudo
+        and snapper before it did anything. The replacement runs exactly
+        one program, by absolute path. Anything it found on PATH would be
+        a program the CALLER chose for a root package transaction.
+        """
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            env, marker = self._buzz_failure_env(root, free=100000)
-            result = subprocess.run(
-                [str(BUZZ), "setup", "--yes", "--no-open"],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            self.assertNotEqual(0, result.returncode)
-            self.assertIn("at least 8 GiB", result.stderr)
-            self.assertFalse(marker.exists(), "provisioning ran before the disk gate")
-
-    @unittest.skipUnless(Path("/usr/bin/flock").exists(), "Linux setup-flow test")
-    def test_successful_buzz_no_open_setup_returns_zero(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            env, _ = self._buzz_failure_env(root, free=100000000000)
             fake = root / "bin"
-            self._write_executable(fake / "curl", "exit 0\n")
-            self._write_executable(fake / "pkexec", "exit 0\n")
-            self._write_executable(fake / "systemctl", "exit 0\n")
-            result = subprocess.run(
-                [str(BUZZ), "setup", "--yes", "--no-open"],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            self.assertEqual(0, result.returncode, result.stderr)
-            self.assertIn("passed setup checks", result.stdout)
+            fake.mkdir()
+            marker = root / "ran"
+            for name in ("df", "curl", "upower", "fuser", "dpkg", "apt",
+                         "apt-get", "sudo", "snapper", "flatpak", "flock",
+                         "sha256sum", "findmnt", "fireproof"):
+                self._write_executable(
+                    fake / name, "echo %s >> %s\n" % (name, marker))
+            env = os.environ.copy()
+            env["PATH"] = "%s:/usr/bin:/bin" % fake
+            for args in (["--help"], ["--version"], ["--nonsense"]):
+                subprocess.run(
+                    [str(DEFAULTS / "data/usr/bin/shadowfetch-update"), *args],
+                    env=env, capture_output=True, text=True, timeout=20)
+            self.assertFalse(
+                marker.exists(),
+                marker.read_text() if marker.exists() else "")
 
-    @unittest.skipUnless(Path("/usr/bin/flock").exists(), "Linux failure-injection test")
-    def test_occupied_buzz_ports_fail_before_provisioning(self):
-        for port in (3000, 9337):
-            with self.subTest(port=port), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
-                env, marker = self._buzz_failure_env(
-                    root, listener_port=port, free=100000000000
-                )
+            if Path("/usr/bin/fireproof").exists():
+                return   # the exec would run the real updater; see below
+            for args in ([], ["--check"], ["--verify"], ["--rollback"]):
                 result = subprocess.run(
-                    [str(BUZZ), "setup", "--yes", "--no-open"],
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                self.assertNotEqual(0, result.returncode)
-                self.assertIn(f"Port {port}", result.stderr)
-                self.assertFalse(marker.exists(), f"provisioning ran with port {port} occupied")
+                    [str(DEFAULTS / "data/usr/bin/shadowfetch-update"), *args],
+                    env=env, capture_output=True, text=True, timeout=20)
+                self.assertEqual(1, result.returncode)
+                self.assertIn("/usr/bin/fireproof is not installed",
+                              result.stderr)
+            self.assertFalse(marker.exists(),
+                             "the shim ran a program it found on PATH")
 
-    @unittest.skipUnless(Path("/usr/bin/flock").exists(), "Linux failure-injection test")
-    def test_invalid_buzz_stack_port_fails_before_podman(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            fake = root / "bin"
-            fake.mkdir()
-            marker = root / "podman-called"
-            self._write_executable(fake / "podman", f"touch {marker!s}\nexit 1\n")
-            self._write_executable(
-                fake / "podman-compose", f"touch {marker!s}\nexit 1\n"
-            )
-            (root / "compose.yml").write_text("services: {}\n")
-            env_file = root / ".env"
-            env_file.write_text("BUZZ_HTTP_PORT=80\n")
-            env_file.chmod(0o600)
-            env = os.environ.copy()
-            env.update({
-                "HOME": str(root / "home"),
-                "XDG_RUNTIME_DIR": str(root / "run"),
-                "PATH": f"{fake}:/usr/bin:/bin",
-                "SHADOWFETCH_BUZZ_PROJECT": "qa-invalid-port",
-                "SHADOWFETCH_BUZZ_COMPOSE_FILE": "compose.yml",
-                "SHADOWFETCH_BUZZ_ENV_FILE": ".env",
-            })
-            (root / "home").mkdir()
-            result = subprocess.run(
-                [str(BUZZ_STACK), "start"],
-                cwd=root,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            self.assertNotEqual(0, result.returncode)
-            self.assertIn("1024 through 65535", result.stderr)
-            self.assertFalse(marker.exists(), "Podman ran with an invalid port")
+    def test_removal_review_is_now_fireproofs_job_not_an_allowlist(self):
+        """State the control transfer instead of pretending nothing changed.
 
-    @unittest.skipUnless(Path("/usr/bin/flock").exists(), "Linux failure-injection test")
-    def test_update_rejects_solver_removal_before_apply(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            fake = root / "bin"
-            fake.mkdir()
-            marker = root / "upgrade-applied"
-            self._write_executable(
-                fake / "df",
-                """
-                printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\n'
-                printf 'fake 1 1 99999999 1%% /\\n'
-                """,
-            )
-            self._write_executable(fake / "curl", "exit 0\n")
-            self._write_executable(fake / "upower", "exit 0\n")
-            self._write_executable(fake / "fuser", "exit 1\n")
-            self._write_executable(fake / "dpkg", "exit 0\n")
-            self._write_executable(fake / "apt", "exit 0\n")
-            self._write_executable(fake / "sudo", 'exec "$@"\n')
-            self._write_executable(
-                fake / "apt-get",
-                f"""
-                case " $* " in
-                    *" -s "*) printf 'Remv protected-package [1.0]\\n' ;;
-                    *" full-upgrade "*) touch {marker!s} ;;
-                esac
-                """,
-            )
-            env = os.environ.copy()
-            env.update({
-                "HOME": str(root / "home"),
-                "XDG_STATE_HOME": str(root / "state"),
-                "PATH": f"{fake}:/usr/bin:/bin",
-            })
-            (root / "home").mkdir()
-            result = subprocess.run(
-                [str(DEFAULTS / "data/usr/bin/shadowfetch-update"), "--check"],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            self.assertNotEqual(0, result.returncode)
-            self.assertIn("Unverified proposed removals", result.stdout)
-            self.assertIn("protected-package", result.stdout)
-            self.assertFalse(marker.exists(), "upgrade ran despite the removal plan")
+        The old updater REFUSED any removal outside a hardcoded two-entry
+        allowlist (libprocesscore10, milou) plus the migration set. That
+        control is GONE - not moved. What Fireproof does instead is
+        weaker in one way and stronger in another, and this test asserts
+        the mechanism that actually exists:
 
-    @unittest.skipUnless(Path("/usr/bin/flock").exists(), "Linux transition test")
-    def test_update_accepts_only_a_verified_debian_replacement(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            fake = root / "bin"
-            fake.mkdir()
-            marker = root / "upgrade-applied"
-            self._write_executable(
-                fake / "df",
-                """
-                printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
-                printf 'fake 1 1 99999999 1%% /\n'
-                """,
-            )
-            self._write_executable(fake / "curl", "exit 0\n")
-            self._write_executable(fake / "upower", "exit 0\n")
-            self._write_executable(fake / "fuser", "exit 1\n")
-            self._write_executable(fake / "dpkg", "exit 0\n")
-            self._write_executable(fake / "apt", "exit 0\n")
-            self._write_executable(fake / "sudo", 'exec "$@"\n')
-            self._write_executable(
-                fake / "apt-get",
-                f"""
-                case " $* " in
-                    *" -s "*)
-                        printf 'Remv milou [4:6.6.5-2]\\n'
-                        printf 'Inst qml6-module-org-kde-milou (4:6.7.2-2)\\n'
-                        ;;
-                    *" full-upgrade "*) touch {marker!s} ;;
-                esac
-                """,
-            )
-            env = os.environ.copy()
-            env.update({
-                "HOME": str(root / "home"),
-                "XDG_STATE_HOME": str(root / "state"),
-                "PATH": f"{fake}:/usr/bin:/bin",
-            })
-            (root / "home").mkdir()
-            result = subprocess.run(
-                [str(DEFAULTS / "data/usr/bin/shadowfetch-update"), "--check"],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
-            self.assertIn("Verified replacement or retirement removals", result.stdout)
-            self.assertIn("milou", result.stdout)
-            self.assertFalse(marker.exists(), "check mode applied the upgrade")
+          * every removal is listed to the user before anything is locked
+            or downloaded (analyze is side-effect free),
+          * any RED package - essential, required/important priority, or a
+            boot/session/network name - flips the dialog default to
+            "Don't proceed",
+          * the human approves one change_set_hash, and a set that drifts
+            between approval and commit is abandoned.
+
+        So removals are no longer refused by a list nobody maintained;
+        they are surfaced and require an explicit approval of that exact
+        set. If a future change claims the old refusal is still enforced,
+        this test is where that claim gets checked.
+        """
+        daemon = (ROOT / "packages/shadowfetch-fireproof/data/usr/libexec"
+                  / "fireproofd").read_text()
+        self.assertIn('"removals": removals', daemon)
+        self.assertIn('"default_dont_proceed"', daemon)
+        self.assertIn("def _is_red(", daemon)
+        self.assertIn("live_hash != expected_hash", daemon)
+        # And the allowlist really is gone from the product, not relocated.
+        for name in ("libprocesscore10", "qml6-module-org-kde-milou"):
+            self.assertNotIn(name, daemon)
+            self.assertNotIn(
+                name,
+                (DEFAULTS / "data/usr/bin/shadowfetch-update").read_text())
 
 
 if __name__ == "__main__":

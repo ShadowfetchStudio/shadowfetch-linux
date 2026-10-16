@@ -6,13 +6,12 @@ shadowfetch-ember deb ships), the pre-flip safety line, the flame animation
 (three states driven by Firewatch1), the readout strip (Firewatch1
 SensorSnapshot — emberd has no sampler), the duration picker (RuntimeMaxSec
 via the pkexec Ember helper), the session-side baloo suspend, and the
-two-card app-profile row (Gaming, Local AI — same engine, tuned presets).
+two-card app-profile row (Gaming, Production — same engine, tuned presets).
 
 Owns NO root logic: every privileged step goes through systemd + polkit or
 the pkexec helper the shadowfetch-ember deb provides.
 """
 
-import shutil
 import subprocess
 
 from PyQt6.QtCore import Qt, QProcess, QRectF, QTimer
@@ -191,6 +190,10 @@ class ProfileCard(Card):
 class EmberPage(QWidget):
     """The Ignite section."""
 
+    @classmethod
+    def build(cls, context):
+        return cls(context.firewatch, context.open_route)
+
     def __init__(self, firewatch: busutil.FirewatchClient, open_route):
         super().__init__()
         self._firewatch = firewatch
@@ -288,10 +291,10 @@ class EmberPage(QWidget):
         for index, profile in enumerate(profiles):
             card = ProfileCard(profile, self._on_profile_toggle)
             if profile.get("show_hwscan") == "yes":
-                open_agents = QPushButton("Open Local AI")
+                open_agents = QPushButton("Open Workspaces")
                 open_agents.setObjectName("quiet")
                 open_agents.setFixedHeight(26)
-                open_agents.clicked.connect(lambda: self._open_route("local-ai"))
+                open_agents.clicked.connect(lambda: self._open_route("workspaces"))
                 card.layout().addWidget(open_agents,
                                         alignment=Qt.AlignmentFlag.AlignLeft)
             self.profile_cards.append(card)
@@ -352,12 +355,19 @@ class EmberPage(QWidget):
             except ValueError:
                 duration = 0
         if duration:
-            args += ["--duration", str(duration)]
-        if args and helper:
+            # ember-duration takes the seconds as a bare positional
+            # argument; a --duration flag is rejected by its parser.
+            args += [str(duration)]
+        pkexec = busutil.trusted_program("pkexec")
+        if args and helper and pkexec:
+            # pkexec decides whether the authorisation dialog the person is
+            # about to answer belongs to this operation. Resolved through
+            # $PATH it is a session-local process that can imitate the dialog
+            # and swallow the operation while reporting success.
             self.note.setText("Waiting for authorisation…")
             self._helper_proc = QProcess(self)
             self._helper_proc.finished.connect(self._helper_done)
-            self._helper_proc.start("pkexec", [helper] + args)
+            self._helper_proc.start(pkexec, [helper] + args)
             return
         if args and not helper:
             self.note.setText(
@@ -374,7 +384,16 @@ class EmberPage(QWidget):
 
     def _helper_done(self, code, _status) -> None:
         if code != 0:
-            self.note.setText("Authorisation was cancelled — Ember was not started.")
+            # 126 = polkit refused or the user dismissed the prompt;
+            # 127 = the helper could not be executed. Anything else is the
+            # helper itself failing, which must not be reported as a
+            # cancelled authorisation.
+            if code == 126:
+                self.note.setText("Authorisation was cancelled — Ember was not started.")
+            elif code == 127:
+                self.note.setText("The Ember helper could not be run — Ember was not started.")
+            else:
+                self.note.setText(f"The Ember helper failed (status {code}) — Ember was not started.")
             self._busy = False
             self._pending_profile = None
             self._refresh_state()
@@ -384,15 +403,16 @@ class EmberPage(QWidget):
     def _start_unit(self) -> None:
         self._proc = QProcess(self)
         self._proc.finished.connect(self._start_done)
-        self._proc.start("systemctl", ["start", busutil.EMBER_UNIT])
+        self._proc.start(busutil.SYSTEMCTL, ["start", busutil.EMBER_UNIT])
 
     def _start_done(self, code, _status) -> None:
         self._busy = False
         if code == 0:
             self._active_profile = self._pending_profile
             self.note.setText("")
-            if shutil.which("balooctl6"):
-                subprocess.Popen(["balooctl6", "suspend"],
+            baloo = busutil.installed_command("balooctl6")
+            if baloo:
+                subprocess.Popen([baloo, "suspend"],
                                  stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL)
         else:
@@ -407,15 +427,16 @@ class EmberPage(QWidget):
         self._busy = True
         self._proc = QProcess(self)
         self._proc.finished.connect(self._stop_done)
-        self._proc.start("systemctl", ["stop", busutil.EMBER_UNIT])
+        self._proc.start(busutil.SYSTEMCTL, ["stop", busutil.EMBER_UNIT])
 
     def _stop_done(self, code, _status) -> None:
         self._busy = False
         self._active_profile = None
         if code == 0:
             self.note.setText("")
-            if shutil.which("balooctl6"):
-                subprocess.Popen(["balooctl6", "resume"],
+            baloo = busutil.installed_command("balooctl6")
+            if baloo:
+                subprocess.Popen([baloo, "resume"],
                                  stdout=subprocess.DEVNULL,
                                  stderr=subprocess.DEVNULL)
         else:

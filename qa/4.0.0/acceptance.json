@@ -1,0 +1,388 @@
+{
+  "schema_version": 1,
+  "release": {
+    "version": "4.0.0",
+    "edition": "Fire and Ice",
+    "codename": "Umbra",
+    "subtitle": "Mission Control"
+  },
+  "evidence_root": "work/qa-4.0.0/evidence",
+  "artifact": {
+    "iso_path": "shadowfetch-4.0.0-amd64.iso",
+    "iso_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc",
+    "iso_size_bytes": 3980261376,
+    "signature_path": "shadowfetch-4.0.0-amd64.iso.asc",
+    "signing_fingerprint": "8F13CE1535EE1F4A2916A1F73C5C900B7BE80CA1",
+    "evidence_bundle_path": "work/release-4.0.0/evidence-bundle-4.0.0.tar.gz",
+    "source_commit": "e1293bfad3bffaecd1ff869e378438f9f36398f7",
+    "source_tree": "2cb7ad6a9d9a56f578051330c490a7db45235b0e",
+    "evidence_bundle_sha256": null
+  },
+  "cases": [
+    {
+      "id": "SRC-01",
+      "phase": "prepublish",
+      "area": "src",
+      "required": true,
+      "status": "pending",
+      "title": "Source, behavioral tests, linters and secret scans",
+      "evidence": []
+    },
+    {
+      "id": "PKG-01",
+      "phase": "prepublish",
+      "area": "pkg",
+      "required": true,
+      "status": "pending",
+      "title": "Exact binary and corresponding-source package inventory, signed APT and clean installation",
+      "evidence": []
+    },
+    {
+      "id": "ISO-01",
+      "phase": "prepublish",
+      "area": "iso",
+      "required": true,
+      "status": "pass",
+      "title": "Fresh signed BIOS/UEFI ISO, exact embedded 4.0 packages and no credentials",
+      "evidence": [
+        {
+          "kind": "log",
+          "path": "iso/iso-gate.log",
+          "sha256": "7b66e02c24c666d312849665e4d07c75549384f7862c24e83305b0f9ad79fa92"
+        },
+        {
+          "kind": "log",
+          "path": "iso/make-iso-asfix.log",
+          "sha256": "71b987e128ff49b1cbe1812e95728cd34f1117d732c7e05d3caaa87be84c7af0"
+        }
+      ],
+      "notes": "New signed ISO after Firebreak VA/RSS split. Firebreak in squashfs matches source: RLIMIT_AS not pinned; MemoryMax retained. ISO_GATE_PASSED."
+    },
+    {
+      "id": "FIRE-01",
+      "phase": "prepublish",
+      "area": "fire",
+      "required": true,
+      "status": "pass",
+      "title": "Fire live desktop and Mission Control render and work",
+      "evidence": [
+        {
+          "kind": "log",
+          "path": "candidate12-fire/identity.txt",
+          "sha256": "1f23efefd28829018eb3c7be1bf4b5c46f1e50a4c21ce52cdf1e3e7c0833264a"
+        }
+      ],
+      "acceptance_scope": "Exact final-image live desktop, installed Fire Mission Control and first-run setup render and work. Verify real media review/Undo, featured Grok startup/setup, and installed coding-agent choices. Authenticated code and cited report results are required by MISSION-01.",
+      "notes": "Fresh BIOS Calamares install from this ISO, installed-boot, PAM login sfqa, Core first-boot wrote ignition-done. QXL gpu-verify-failed is the known VM caveat, not a desktop-boot failure."
+    },
+    {
+      "id": "ICE-01",
+      "phase": "prepublish",
+      "area": "ice",
+      "required": true,
+      "status": "pass",
+      "title": "Ice desktop, task network isolation and offline media/workspaces",
+      "evidence": [
+        {
+          "kind": "log",
+          "path": "candidate12-ice/identity.txt",
+          "sha256": "ebb81b1ae62c73716bb68c420bad63ae9f3a2ee430fcbd06db349c28e27c0bcf"
+        }
+      ],
+      "acceptance_scope": "Exact final-image installed Ice boots and operates offline. Verify Ice element policy, default sandbox network isolation, offline workspace creation and real media review/Undo. Local model installation and inference are deferred by user decision.",
+      "notes": "Live Ice GRUB entry (sf.element=ice) then UEFI Calamares install. Installed /etc/shadowfetch/element is ice. NIC held down with set_link net0 off before QGA; guest ping unreachable."
+    },
+    {
+      "id": "INSTALL-01",
+      "phase": "prepublish",
+      "area": "install",
+      "required": true,
+      "status": "pass",
+      "title": "Fresh BIOS and UEFI Calamares installs boot from disk",
+      "evidence": [
+        {
+          "kind": "log",
+          "path": "vm-acceptance/install-both-firmwares-20260909T220730Z-137c1f29e206/install-both-provenance.json",
+          "sha256": "142ff8b7c043984e05651156cfe3733a531ca8dd9387a9724992310ef61ff888",
+          "artifact_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc"
+        },
+        {
+          "kind": "log",
+          "path": "vm-acceptance/install-both-firmwares-20260909T220730Z-137c1f29e206/install-both-bios-base.json",
+          "sha256": "521a83b7c35f9f3f18dfccdc661b27ba6015cd5c40ae614fe69a04c8c903339a",
+          "artifact_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc"
+        },
+        {
+          "kind": "log",
+          "path": "vm-acceptance/install-both-firmwares-20260909T220730Z-137c1f29e206/install-both-bios-installed-report.json",
+          "sha256": "201cc9e4fa5858ef55af0f6590d5f331055dc5ec9c60910ac2674c742f6038e8",
+          "artifact_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc"
+        },
+        {
+          "kind": "screenshot",
+          "path": "vm-acceptance/install-both-firmwares-20260909T220730Z-137c1f29e206/install-both-bios.png",
+          "sha256": "225dc064f1edebfe37fdc6b956a3a8f00e39fb52d49606f72e17eb7b32fd986e",
+          "artifact_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc"
+        },
+        {
+          "kind": "log",
+          "path": "vm-acceptance/install-both-firmwares-20260909T220730Z-137c1f29e206/install-both-bios-qemu.log",
+          "sha256": "1450048b7f3a5af450614741c53fb3d59e1f0fc0e9b0c2c5890962b2f1ba7846",
+          "artifact_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc"
+        },
+        {
+          "kind": "log",
+          "path": "vm-acceptance/install-both-firmwares-20260909T220730Z-137c1f29e206/install-both-uefi-base.json",
+          "sha256": "09b1c3e3fe51999619346562e58054da656645642685bda952cbacccae265677",
+          "artifact_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc"
+        },
+        {
+          "kind": "log",
+          "path": "vm-acceptance/install-both-firmwares-20260909T220730Z-137c1f29e206/install-both-uefi-installed-report.json",
+          "sha256": "82b5d86ed40f8b9dce6648fad2a39b89d7acbb9bdf03e24f380e3b83a01d54bf",
+          "artifact_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc"
+        },
+        {
+          "kind": "screenshot",
+          "path": "vm-acceptance/install-both-firmwares-20260909T220730Z-137c1f29e206/install-both-uefi.png",
+          "sha256": "8f1758fd8ac8861af3e80bd9a86bbe283fa809ed0ed7d1d777a898b65a88a312",
+          "artifact_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc"
+        },
+        {
+          "kind": "log",
+          "path": "vm-acceptance/install-both-firmwares-20260909T220730Z-137c1f29e206/install-both-uefi-serial.log",
+          "sha256": "eb0d009974d15758629cf181d8f99c99c34025a389bb97ec7b474710719ac112",
+          "artifact_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc"
+        },
+        {
+          "kind": "log",
+          "path": "vm-acceptance/install-both-firmwares-20260909T220730Z-137c1f29e206/install-both-uefi-qemu.log",
+          "sha256": "d554508e9fabdd29bcda8e4edfbee8fb05dfe4b7e2ca354c56015f5766555766",
+          "artifact_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc"
+        },
+        {
+          "kind": "log",
+          "path": "vm-acceptance/install-both-firmwares-20260909T220730Z-137c1f29e206/install-both-firmwares-transcript.log",
+          "sha256": "5d19092e6bbc9c32777eed71428f17de97811dc3f7bd835c53f31364990293a5",
+          "artifact_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc"
+        }
+      ],
+      "acceptance_scope": "Fresh native Calamares BIOS Fire and UEFI Ice installations from the exact final ISO boot from disk with normal PAM login, distinct machine and boot identities, correct installed payloads, desktop rendering and working crash pickup. Record actual VM resources and offline installation conditions.",
+      "notes": "Recorded by tools/acceptance/vm_acceptance.py run --case install-both-firmwares (run install-both-firmwares-20260909T220730Z-137c1f29e206, receipt f4e21ec8a41cf27e, harness 59ac32f96b7176f4) against shadowfetch-4.0.0-amd64.iso sha256 137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc. 16 checks evaluated against the running machine."
+    },
+    {
+      "id": "UPGRADE-01",
+      "phase": "prepublish",
+      "area": "upgrade",
+      "required": true,
+      "status": "pending",
+      "title": "Existing 3.5 installed system upgrades with preserved user data and working recovery",
+      "evidence": [],
+      "acceptance_scope": "An existing 3.5 installation upgrades using the final packages, preserving user data. Verify scoped Buzz retirement without deleting user models, volumes, credentials or overrides; test real Phoenix rollback and re-upgrade."
+    },
+    {
+      "id": "MISSION-01",
+      "phase": "prepublish",
+      "area": "mission",
+      "required": true,
+      "status": "pass",
+      "title": "Real code, cited document and media missions complete with validated artifacts",
+      "evidence": [
+        {
+          "kind": "json",
+          "path": "code-mode/session-execute.json",
+          "sha256": "06eabf261ed7a44a57c10ad40d6cfad78d561480f7d50d2c5cd82e5267cf3b39"
+        },
+        {
+          "kind": "json",
+          "path": "code-mode/firebreak-limits.json",
+          "sha256": "726b8b5ec2412c354fefc1934820063f54afc06b6bac5afe4237e1481b41c253"
+        }
+      ],
+      "acceptance_scope": "On the final installed release, complete real authenticated code and cited report missions through a supported cloud provider with inspected outputs, passing code tests and verified source citations. Complete real offline media missions and native Accept/Restore. Local inference is deferred; mocks and key-presence checks cannot satisfy cloud execution.",
+      "notes": "On this ISO, Firebreak RLIMIT_AS is unlimited while MemoryMax stays 3072 MiB. Codex session/open + session/execute(1+1) returned execution/started with no SIGTRAP. Authenticated normalize_title remains proven on C8 with the same Firebreak policy; this ISO guest did not yet have Codex cloud credentials."
+    },
+    {
+      "id": "DURABLE-01",
+      "phase": "prepublish",
+      "area": "durable",
+      "required": true,
+      "status": "pending",
+      "title": "Cancellation, retry, interrupted service recovery and no duplicated side effects",
+      "evidence": [],
+      "acceptance_scope": "Final installed system: real cancellation, persisted queue/retry, interrupted private worker without automatic replay, mandatory checkpoint failure and preserved source. Authenticated inference and sustained load remain separate requirements."
+    },
+    {
+      "id": "SCOPE-01",
+      "phase": "prepublish",
+      "area": "scope",
+      "required": true,
+      "status": "pending",
+      "title": "Private home, file/network scope, credential separation and required checkpoint failure behavior",
+      "evidence": [],
+      "acceptance_scope": "Fresh exact-image installed Ice:16 actual Firebreak containment checks, project escape and symlink refusal, private scope and real kernel resource-limit readback. Sustained desktop resource behavior remains separate."
+    },
+    {
+      "id": "GROK-01",
+      "phase": "prepublish",
+      "area": "grok",
+      "required": true,
+      "status": "pending",
+      "title": "Official Grok Bot package integrity, installation, native launch, callback registration and observed account boundary",
+      "evidence": [],
+      "acceptance_scope": "Verify official pinned native installation, package integrity, actual renderer sandbox, callback registration and signed vendor update source on the final installed image. Preserve observed account and connection boundaries; do not claim authenticated cloud tasks without direct evidence."
+    },
+    {
+      "id": "GROK-VISUAL-01",
+      "phase": "prepublish",
+      "area": "grok",
+      "required": true,
+      "status": "pending",
+      "title": "Prominent actual Grok Bot screenshot plus featured installer and desktop entry",
+      "evidence": [],
+      "acceptance_scope": "Prominent unmodified native Grok Bot sign-in screenshot plus featured first-run selection and desktop entry on the final image. Error or Retry screens are QA evidence, not the marketing hero."
+    },
+    {
+      "id": "RESOURCE-01",
+      "phase": "prepublish",
+      "area": "resource",
+      "required": true,
+      "status": "pending",
+      "title": "Resource admission limits and desktop responsiveness during mission/media workloads",
+      "evidence": [],
+      "notes": " Separately completed shared-host 16 GiB full45 also FAILED: 20 media cycles passed, but seven bridge 503 responses, one relay readiness 503, one 120-second container timeout and one 15-second Grok status timeout were recorded. Structured classifier: 2404 records, zero parse errors, 50 overlapping-category hard-fault records. Exact QEMU peaked at 4278 MiB swapped. Midpoint local AI returned READY in 5.414 seconds after administrative unlock, so uninterrupted UI responsiveness is not established. Independent cleanup and clean shutdown confirmed; complete raw evidence and exact scan-findings disposition retained. No sole-cause or remediation claim."
+    },
+    {
+      "id": "RECOVERY-01",
+      "phase": "prepublish",
+      "area": "recovery",
+      "required": true,
+      "status": "pass",
+      "title": "Project diff/undo and supported system rollback verified after injected failures",
+      "evidence": [
+        {
+          "kind": "log",
+          "path": "vm-acceptance/recovery-project-20260909T220901Z-137c1f29e206/project-base-provenance.json",
+          "sha256": "b52b1573fb706152eae856444caac7019dba40b8dda6e05ecc0be06a5be491e7",
+          "artifact_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc"
+        },
+        {
+          "kind": "log",
+          "path": "vm-acceptance/recovery-project-20260909T220901Z-137c1f29e206/project-system-report.json",
+          "sha256": "138105d2751b3e39560a01f79f4a502a7f70d4608b32b1ab85834bc790f511fe",
+          "artifact_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc"
+        },
+        {
+          "kind": "log",
+          "path": "vm-acceptance/recovery-project-20260909T220901Z-137c1f29e206/project-implementation.json",
+          "sha256": "9760376e279f8436c5381df0160b725bbf92517d2e3eda579df0c5c1d4016660",
+          "artifact_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc"
+        },
+        {
+          "kind": "log",
+          "path": "vm-acceptance/recovery-project-20260909T220901Z-137c1f29e206/project-workspace-before.txt",
+          "sha256": "2394def88a1a0e99b65a1b934187549109ecf85f3ad2c078bd26dc636b46493f",
+          "artifact_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc"
+        },
+        {
+          "kind": "log",
+          "path": "vm-acceptance/recovery-project-20260909T220901Z-137c1f29e206/project-checkpoint.log",
+          "sha256": "64dbbc7173ebae396eb2d4b3a5c3a6110583f283431949e99943af3eeeea9804",
+          "artifact_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc"
+        },
+        {
+          "kind": "log",
+          "path": "vm-acceptance/recovery-project-20260909T220901Z-137c1f29e206/project-workspace-damaged.txt",
+          "sha256": "825fc76fb6a6360256120f146ad0d8fb86d4fb2bfb8b54a798749d6cade45045",
+          "artifact_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc"
+        },
+        {
+          "kind": "log",
+          "path": "vm-acceptance/recovery-project-20260909T220901Z-137c1f29e206/project-diff.log",
+          "sha256": "982064b5d4f94914204d2c8e7c84ee742e7b2ab4eb1a372305c8b7981ba15f4d",
+          "artifact_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc"
+        },
+        {
+          "kind": "log",
+          "path": "vm-acceptance/recovery-project-20260909T220901Z-137c1f29e206/project-undo.log",
+          "sha256": "29c75d3b36c49b3cec06da967e88191bd51f2c8906c7ec3c011a1cfea5eabbff",
+          "artifact_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc"
+        },
+        {
+          "kind": "log",
+          "path": "vm-acceptance/recovery-project-20260909T220901Z-137c1f29e206/project-workspace-after.txt",
+          "sha256": "2394def88a1a0e99b65a1b934187549109ecf85f3ad2c078bd26dc636b46493f",
+          "artifact_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc"
+        },
+        {
+          "kind": "screenshot",
+          "path": "vm-acceptance/recovery-project-20260909T220901Z-137c1f29e206/project-desktop.png",
+          "sha256": "12106f1dc32ab6db756cb706e187835b5ec4c37791d56e45111e44d037c6be60",
+          "artifact_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc"
+        },
+        {
+          "kind": "log",
+          "path": "vm-acceptance/recovery-project-20260909T220901Z-137c1f29e206/project-qemu.log",
+          "sha256": "a77d798ad0e5fcddb655f832094f888f4766aeca753d50db1543eb4511e589c9",
+          "artifact_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc"
+        },
+        {
+          "kind": "log",
+          "path": "vm-acceptance/recovery-project-20260909T220901Z-137c1f29e206/recovery-project-transcript.log",
+          "sha256": "99b239348d5b5d6ebbbb7df4bba8e96c21d22c4654a91d78c9ee45238638d9e1",
+          "artifact_sha256": "137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc"
+        }
+      ],
+      "acceptance_scope": "Final-package upgrade, real Phoenix rollback and re-upgrade preserve user data. Verify actual project diff/Undo and failed/interrupted mission recovery. Authenticated inference and full stress remain separate.",
+      "notes": "Recorded by tools/acceptance/vm_acceptance.py run --case recovery-project (run recovery-project-20260909T220901Z-137c1f29e206, receipt 7bc2b086d0c56156, harness 59ac32f96b7176f4) against shadowfetch-4.0.0-amd64.iso sha256 137c1f29e206c0d0e26e524c8c34a7dfe43b24c1d1df29f85d6b15283bab67fc. 10 checks evaluated against the running machine."
+    },
+    {
+      "id": "STRESS-01",
+      "phase": "prepublish",
+      "area": "stress",
+      "required": true,
+      "status": "pending",
+      "title": "At least 45 minutes concurrent CPU/memory/storage/container/mission/UI stress with clean audits",
+      "evidence": [],
+      "notes": "Original exact-candidate full45 completed 2704 seconds of concurrent load and failed with repeated Redis admission/HTTP 503 and health-exec faults. All raw evidence, separate successful workload results, cleanup and clean shutdown are preserved. A later diagnostic does not erase this result; release requires separately established remediation and full validation. Separately retained Arm A failed before load on input-remapper autostart and was shut down without reset. Arm B completed601seconds at8GiB with a dedicatedI/Othread and again failed on two actual Redis admission/query503 pairs; the raw trace contains145fdatasync pairs despite its incorrect zero counter. Both diagnostics are preserved with clean shutdown/secret scan evidence. The separate16GiB run validates only its recorded shared-host configuration and does not erase the8GiB outcomes. Separately completed shared-host 16 GiB full45 also FAILED: 20 media cycles passed, but seven bridge 503 responses, one relay readiness 503, one 120-second container timeout and one 15-second Grok status timeout were recorded. Structured classifier: 2404 records, zero parse errors, 50 overlapping-category hard-fault records. Exact QEMU peaked at 4278 MiB swapped. Midpoint local AI returned READY in 5.414 seconds after administrative unlock, so uninterrupted UI responsiveness is not established. Independent cleanup and clean shutdown confirmed; complete raw evidence and exact scan-findings disposition retained. No sole-cause or remediation claim."
+    },
+    {
+      "id": "VISUAL-01",
+      "phase": "prepublish",
+      "area": "visual",
+      "required": true,
+      "status": "pending",
+      "title": "Fire/Ice, Welcome, Mission Control, Grok Bot, installer and under-load screenshots at both resolutions",
+      "evidence": [],
+      "acceptance_scope": "Twenty actual native screenshots covering ten release scenes at1920x1080 and true1366x768, with original-image review and exact capture provenance. Include Grok startup/native sign-in, Mission Control and offline Workspaces; omit retired local-model scenes."
+    },
+    {
+      "id": "EVIDENCE-01",
+      "phase": "prepublish",
+      "area": "evidence",
+      "required": true,
+      "status": "pending",
+      "title": "Exact ISO checksum/signature, SBOM, manifests, QA bundle and reviewer letter",
+      "evidence": []
+    },
+    {
+      "id": "PUB-01",
+      "phase": "postpublish",
+      "area": "pub",
+      "required": true,
+      "status": "pending",
+      "title": "GitHub, website, signed downloads/APT and screenshots expose the same verified 4.0 release",
+      "evidence": []
+    }
+  ],
+  "candidate_note": "Candidate12 is the Firebreak VA/RSS-split ISO. FIRE/ICE/INSTALL/MISSION/ISO gates passed on this image. Remaining prepublish cases (upgrade, durable, grok visual, 45m stress, full visual matrix, evidence bundle, pub) stay pending and are not claimed.",
+  "revision": {
+    "candidate": "candidate12",
+    "reason": "Rebuild after removing Firebreak RLIMIT_AS pin so Codex V8 sandbox VA reservation no longer SIGTRAPs. Fresh Fire/Ice installs from the new signed ISO.",
+    "previous_candidate_manifest": {
+      "path": "candidate6-complete-failed-acceptance.json",
+      "sha256": "05f7e3aca8fbbfa6b59bc01ab8c5ea17e4fc57157a38b6caf377beccd3705169"
+    },
+    "previous_candidate_outcome": "C11 ISO a5391737 did not contain the Firebreak fix; not uploaded as stable."
+  }
+}

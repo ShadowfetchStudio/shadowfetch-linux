@@ -66,11 +66,16 @@ from PyQt6.QtWidgets import (
 BG = "#151619"
 CARD = "#202126"
 BORDER = "#34363d"
-GOLD = "#d8a24a"
+GOLD = "#f2b33d"
 TEXT = "#f0eee9"
 MUTED = "#aaa69f"
 GREEN = "#72c69c"
-RED = "#e07a6a"
+# This window is mounted inside the Control Center, so its error colour has to
+# be the Control Center's. It was a paler, oranger red than sfcc/theme.py used,
+# so one failure message changed hue depending on which frame you were looking
+# at (ARCHITECTURE_AUDIT.md:246). tools/truth/palette.json now owns the
+# app-chrome surface, and tools/drift_gate.py fails on a third red.
+RED = "#e2533b"
 
 BUS_NAME = "org.shadowfetch.Fireproof1"
 OBJ_PATH = "/org/shadowfetch/Fireproof1"
@@ -143,8 +148,8 @@ class FireproofPage(QWidget):
             QProgressBar::chunk {{ background: {GOLD}; border-radius: 5px; }}
             QPushButton {{ background: {GOLD}; color: #151515; border: 0; border-radius: 6px;
                            padding: 6px 12px; font-weight: 700; }}
-            QPushButton:hover {{ background: #efb95d; }}
-            QPushButton:pressed {{ background: #bf8735; }}
+            QPushButton:hover {{ background: #ffc95e; }}
+            QPushButton:pressed {{ background: #b97e22; }}
             QPushButton:disabled {{ background: {BORDER}; color: {MUTED}; }}
             QPushButton#quiet {{ background: {CARD}; color: {TEXT}; border: 1px solid {BORDER}; }}
             QPushButton#danger {{ background: {RED}; color: #151515; }}
@@ -177,6 +182,9 @@ class FireproofPage(QWidget):
         self.summary_label = QLabel("Analyzing… (no lock is taken and "
                                     "nothing is downloaded)")
         self.summary_label.setWordWrap(True)
+        # Selectable: on an interrupted system it carries the repair command.
+        self.summary_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
         self.banner_label = QLabel("")
         self.banner_label.setObjectName("bad")
         self.banner_label.setWordWrap(True)
@@ -315,7 +323,19 @@ class FireproofPage(QWidget):
         self.analysis = a
         c = a["counts"]
         b = a["banners"]
-        if c["total"] == 0:
+        interrupted = a.get("interrupted")
+        if interrupted:
+            # fireproofd offers no change set on a half-configured system;
+            # the page says why and gives the repair, and Update stays off.
+            self.summary_label.setText(interrupted["message"])
+            self.update_button.setEnabled(False)
+        elif c["total"] == 0 and (a.get("held_back") or {}).get("packages"):
+            self.summary_label.setText(
+                "Nothing to install now: %d updates are held back so that "
+                "nothing is removed."
+                % len(a["held_back"]["packages"]))
+            self.update_button.setEnabled(False)
+        elif c["total"] == 0:
             self.summary_label.setText(
                 "Your system is up to date against the current package "
                 "lists. Nothing is pending.")
@@ -341,6 +361,8 @@ class FireproofPage(QWidget):
         if b.get("same_set_rollback"):
             banners.append("This is the same update that was rolled back on "
                            "%s." % b["same_set_rollback"]["date"])
+        if b.get("held_back"):
+            banners.append(b["held_back"])
         if not b.get("phoenix_available"):
             banners.append("No Phoenix Point — rollback unavailable "
                            "(Phoenix Points require the Btrfs filesystem, "
@@ -348,10 +370,18 @@ class FireproofPage(QWidget):
         self.banner_label.setText("\n".join(banners))
         self.banner_label.setVisible(bool(banners))
 
+        held_back = (a.get("held_back") or {}).get("packages") or []
+        held_lines = []
         if a["holds"]:
-            self.holds_label.setText(
+            held_lines.append(
                 "Held: " + ", ".join("%s (pinned, will not update)" % h["name"]
                                      for h in a["holds"]))
+        if held_back:
+            held_lines.append(
+                "Held back until the Debian transition completes: "
+                + ", ".join(h["name"] for h in held_back))
+        if held_lines:
+            self.holds_label.setText("\n".join(held_lines))
             self.holds_label.show()
         else:
             self.holds_label.hide()
@@ -388,7 +418,7 @@ class FireproofPage(QWidget):
     # ---- update ----------------------------------------------------------
 
     def confirm_update(self):
-        if not self.analysis or self.busy:
+        if not self.analysis or self.busy or self.analysis.get("interrupted"):
             return
         b = self.analysis["banners"]
         box = QMessageBox(self)

@@ -10,7 +10,7 @@
 #   make distclean  Wipe everything regenerable
 
 SHELL := /bin/bash
-VERSION  ?= 3.5.0
+VERSION  ?= 5.0.1
 CODENAME ?= umbra
 ISO_NAME := shadowfetch-$(VERSION)-amd64.iso
 VERSION_TOKEN := $(subst .,_,$(VERSION))
@@ -34,14 +34,24 @@ PACKAGES := \
 	shadowfetch-control-center \
 	shadowfetch-fireproof \
 	shadowfetch-hwscan \
-	shadowfetch-fireline
+	shadowfetch-fireline \
+	shadowfetch-missions \
+	shadowfetch-drkonqi-pickup
 
 # GPG key the APT repo signs with. Override with `make REPO_KEY_ID=...` if
 # you've regenerated the key. The default matches the key on shadowfetch-linux.
 REPO_KEY_ID ?= 8F13CE1535EE1F4A2916A1F73C5C900B7BE80CA1
 # Generate an apt Valid-Until field automatically so clients do not break on
 # stale metadata after publication. Reprepro accepts durations such as 14d.
-REPO_VALID_FOR ?= 14d
+#
+# This was 14d, which is only safe for a repository that is republished on a
+# schedule. Nothing republishes this one, so every installed machine lost
+# `apt update` a fortnight after each release -- the index published with
+# 4.0.0 on 2026-09-06 was already down to twelve days when this was found.
+# A longer window trades a little rollback-attack protection for a
+# repository that stays usable between releases; shorten it again only
+# alongside an automated `make refresh-index` job.
+REPO_VALID_FOR ?= 180d
 # Publication gate minimum remaining Valid-Until lifetime: 24 hours.
 REPO_MIN_VALID_FOR_SECONDS ?= 86400
 # `sudo make iso` keeps SUDO_USER but changes HOME to /root. Point GnuPG at
@@ -62,27 +72,49 @@ LB_DIR    := $(ROOT)/live-build
 LB_BUILD_LOG := $(BUILD_DIR)/live-build-$(VERSION).log
 LB_BUILD_MARKER := $(BUILD_DIR)/.live-build-$(VERSION)-started
 QA_EVIDENCE_DIR := $(ROOT)/work/qa-$(VERSION)/evidence
-ISO_GATE_LOG := $(QA_EVIDENCE_DIR)/iso/iso-gate.log
-SOURCE_GATE := $(ROOT)/tools/source_gate_$(VERSION_TOKEN).py
-PACKAGE_GATE := $(ROOT)/tools/package_gate_$(VERSION_TOKEN).py
-ISO_GATE := $(ROOT)/tools/iso_gate_$(VERSION_TOKEN).py
-ACCEPTANCE_TOOL := $(ROOT)/tools/verify_acceptance_$(VERSION_TOKEN).py
+# RUN-STAMPED, and deliberately not the path ISO-01 records as its evidence.
+# This was $(QA_EVIDENCE_DIR)/iso/iso-gate.log -- exactly the file the manifest
+# pins -- so `make iso-gate` teed its own verdict into its own evidence, and
+# the proof that the ISO gate passed was the gate saying so. It also meant a
+# second run overwrote the file whose SHA-256 the manifest had recorded, so
+# `acceptance.py verify` then failed on a hash mismatch for a case nobody had
+# touched. A gate never writes into the file it will be graded on.
+ISO_GATE_RUN := $(shell date -u +%Y%m%dT%H%M%SZ)
+ISO_GATE_LOG := $(QA_EVIDENCE_DIR)/iso/runs/iso-gate-$(ISO_GATE_RUN).log
+# Stage Q: ONE implementation per gate family plus a version DATA file.
+# These used to be $(ROOT)/tools/<family>_$(VERSION_TOKEN).py, so cutting a
+# release meant copying four modules and hand-editing the version strings in
+# each. Everything that varies per release now lives in RELEASE_DATA, and every
+# gate is passed --version so a run can never silently gate the wrong release.
+RELEASE_TOOLS := $(ROOT)/tools/release
+RELEASE_DATA := $(RELEASE_TOOLS)/versions/$(VERSION).toml
+SOURCE_GATE := $(RELEASE_TOOLS)/source_gate.py
+PACKAGE_GATE := $(RELEASE_TOOLS)/package_gate.py
+ISO_GATE := $(RELEASE_TOOLS)/iso_gate.py
+ACCEPTANCE_TOOL := $(RELEASE_TOOLS)/acceptance.py
 ACCEPTANCE_MANIFEST := $(ROOT)/qa/$(VERSION)/acceptance.json
-RELEASE_DEBS := $(BUILD_DIR)/*_$(VERSION)-1_all.deb $(BUILD_DIR)/*_$(VERSION)-1_amd64.deb $(BUILD_DIR)/grub-btrfs_*_all.deb
+# ShadowCode is the one PREBUILT package: its .deb is upstream's signed bytes,
+# fetched and authenticated by tools/fetch_shadowcode.py, never built here, so
+# it is not in PACKAGES. The version lives only in tools/release/shadowcode.toml;
+# this asks the tool for the exact build/ path rather than globbing, so a stale
+# previous version can never be picked up.
+SHADOWCODE_FETCH := $(ROOT)/tools/fetch_shadowcode.py
+SHADOWCODE_DEB := $(shell python3 $(SHADOWCODE_FETCH) --print-build-deb 2>/dev/null)
+RELEASE_DEBS := $(BUILD_DIR)/*_$(VERSION)-1_all.deb $(BUILD_DIR)/*_$(VERSION)-1_amd64.deb $(BUILD_DIR)/grub-btrfs_*_all.deb $(SHADOWCODE_DEB)
 PACKAGES_STAMP := $(BUILD_DIR)/.packages-$(VERSION)
 
 R2_BUCKET ?= shadowfetch-linux
 # Cloudflare R2 S3-compatible endpoint for this account.
-# (wrangler can't PUT > 300 MiB; aws-cli with R2's S3 API handles multipart.)
+# The release publisher uses the S3 API with multipart uploads.
 R2_ENDPOINT ?= https://<CLOUDFLARE_ACCOUNT_ID>.r2.cloudflarestorage.com
 R2_REGION   ?= auto
 
-# Used by sync-from-linux (Mac-side flow): host + path to the build box.
+# Used by sync-from-linux for read-only artifact inspection.
 LINUX_HOST ?= shadowfetch-linux
-LINUX_PATH ?= ~/projects/shadowfetch-3.5.0
+LINUX_PATH ?= ~/projects/shadowfetch-4.0.0
 
-.PHONY: all help test source-gate package-gate iso-gate acceptance-audit deps packages repo iso sign pre-release-check publish qemu clean distclean \
-        sync-from-linux deploy-worker ship stamp-version
+.PHONY: all help test attacks release-data source-gate package-gate iso-gate acceptance-audit acceptance-gate deps packages repo refresh-index check-index iso sign pre-release-check publish qemu clean distclean \
+        sync-from-linux deploy-worker ship stamp-version shadowcode shadowcode-smoke
 
 all: iso
 
@@ -93,36 +125,119 @@ help:
 	@echo "  make source-gate Run tests, parsers, linters and secret scans"
 	@echo "  make package-gate Validate packages, signed repo and clean install"
 	@echo "  make iso-gate   Validate the signed hybrid ISO and installed-image payload"
-	@echo "  make acceptance-audit Validate the current release manifest and pending evidence"
+	@echo "  make acceptance-audit Report on the release manifest (does NOT fail on pending)"
+	@echo "  make acceptance-gate  HARD gate: every required case must pass or be waived"
+	@echo "  make vm-acceptance    Run one VM acceptance case (VM_CASE=...) end to end"
 	@echo "  make packages   Build all .deb packages"
 	@echo "  make repo       Build local APT repository"
+	@echo "  make refresh-index Re-sign the APT indices in place (no rebuild)"
+	@echo "  make check-index Fail if the APT index is expired or expiring"
 	@echo "  make iso        Build the bootable ISO (requires sudo)"
 	@echo "  make qemu       Boot ISO in QEMU for testing"
 	@echo "  make clean      Clean live-build artifacts"
 	@echo "  make distclean  Wipe all regenerable files"
 
 test:
+	bash tools/build_drkonqi_pickup.sh --test
+	python3 -m unittest discover -s packages/shadowfetch-missions/tests -v
+	QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s packages/shadowfetch-control-center/tests -v
+	QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s packages/shadowfetch-welcome/tests -v
 	python3 -m unittest discover -s packages/shadowfetch-defaults/tests -v
 	python3 -m unittest discover -s packages/shadowfetch-firewatchd/tests -v
 	python3 -m unittest discover -s packages/shadowfetch-fireproof/tests -v
 	python3 -m unittest discover -s packages/shadowfetch-hwscan/tests -v
-	python3 packages/shadowfetch-fireline/tests/test_ai_ignition.py
+	python3 -m unittest discover -s packages/shadowfetch-phoenix/tests -v
 	python3 packages/shadowfetch-fireline/tests/test_fireline_mcp.py
 	python3 packages/shadowfetch-fireline/tests/test_checkpoint_roundtrip.py
+	python3 packages/shadowfetch-fireline/tests/test_checkpoint_hardening.py
+	python3 packages/shadowfetch-fireline/tests/test_firebreak_4.py
+	python3 packages/shadowfetch-fireline/tests/test_fireline_privilege.py
+	python3 -m unittest discover -s packages/shadowfetch-fireline/tests \
+		-t packages/shadowfetch-fireline/tests -p 'test_firebreak_records.py' -v
+	python3 -m unittest discover -s packages/shadowfetch-fireline/tests \
+		-t packages/shadowfetch-fireline/tests -p 'test_mcp_audit.py' -v
+	SHADOWFETCH_FIREBREAK_TEST_BIN=$(CURDIR)/packages/shadowfetch-fireline/data/usr/bin/shadowfetch-firebreak \
+	SHADOWFETCH_CHECKPOINT_BIN=$(CURDIR)/packages/shadowfetch-fireline/data/usr/bin/shadowfetch-checkpoint \
+	bash packages/shadowfetch-fireline/tests/test_firebreak.sh
 	python3 -m unittest discover -s tools/tests -v
+	$(MAKE) attacks
 
-source-gate:
+# Adversarial suites. Separate from `test` only in name: `test` runs them.
+# They assert what the system REFUSES, which unit tests structurally cannot --
+# a test written against the implementation cannot notice a guard the
+# implementation never had.
+attacks:
+	python3 tools/attacks/attack_approval.py
+	python3 tools/attacks/attack_integrity.py
+	python3 tools/attacks/attack_lifecycle.py
+	python3 tools/attacks/attack_concurrency.py
+	python3 tools/attacks/attack_verifier.py
+	python3 tools/attacks/attack_domain.py
+
+# release-data is a prerequisite of every gate: a missing version file must
+# fail here, naming the file to add, rather than inside a gate half a run later.
+release-data:
+	@test -f $(RELEASE_DATA) || { echo "Missing release data: $(RELEASE_DATA) -- cutting a release needs one version file, see tools/release/README.md" >&2; exit 1; }
+
+source-gate: release-data
 	@test -x $(SOURCE_GATE) || { echo "Missing source gate: $(SOURCE_GATE)" >&2; exit 1; }
-	$(SOURCE_GATE)
+	$(SOURCE_GATE) --version $(VERSION)
 
-package-gate: repo
+package-gate: repo release-data
 	@test -x $(PACKAGE_GATE) || { echo "Missing package gate: $(PACKAGE_GATE)" >&2; exit 1; }
-	$(PACKAGE_GATE)
+	$(PACKAGE_GATE) --version $(VERSION)
 
-acceptance-audit:
+acceptance-audit: release-data
 	@test -x $(ACCEPTANCE_TOOL) || { echo "Missing acceptance tool: $(ACCEPTANCE_TOOL)" >&2; exit 1; }
 	@test -f $(ACCEPTANCE_MANIFEST) || { echo "Missing acceptance manifest: $(ACCEPTANCE_MANIFEST)" >&2; exit 1; }
-	$(ACCEPTANCE_TOOL) --manifest $(ACCEPTANCE_MANIFEST) verify --allow-pending
+	$(ACCEPTANCE_TOOL) --version $(VERSION) --manifest $(ACCEPTANCE_MANIFEST) acceptance-audit
+
+# The HARD gate. acceptance-audit reports and exits 0 even with pending
+# cases, which is how 4.0.0 was published with thirteen of eighteen required
+# cases unproven. This target refuses unless every required case is pass or
+# waived and every artifact field is recorded. A release must depend on this,
+# not on the audit.
+acceptance-gate: release-data
+	@test -x $(ACCEPTANCE_TOOL) || { echo "Missing acceptance tool: $(ACCEPTANCE_TOOL)" >&2; exit 1; }
+	@test -f $(ACCEPTANCE_MANIFEST) || { echo "Missing acceptance manifest: $(ACCEPTANCE_MANIFEST)" >&2; exit 1; }
+	$(ACCEPTANCE_TOOL) --version $(VERSION) --manifest $(ACCEPTANCE_MANIFEST) acceptance-gate
+
+# Stage R: automated VM acceptance. The harness boots the artifact under test in
+# QEMU/KVM, executes one case against the running machine, captures evidence,
+# binds it to the artifact digest and appends a hash-chained receipt -- in ONE
+# workflow. There is no TARGET here that marks a case passed: recording is a
+# switch on the run, reachable only at the end of a run that happened and only
+# for a PASS.
+#
+# BE PRECISE ABOUT WHAT THAT CLOSES, because this comment used to overstate it.
+# It closes the gap for the harness. It does NOT close it for the system:
+# `tools/release/acceptance.py record <case> --status pass --evidence <file>`
+# is a supported command with no run behind it, and it is how every currently
+# recorded pass in the manifest was written. What now stands between that
+# command and a false pass is not this target -- it is that `record` stamps the
+# artifact digest into each evidence entry and `verify` refuses evidence that
+# names a different image or none at all. A person can still type a pass; they
+# can no longer type one about nothing.
+# Exit status: 0 PASS, 1 FAIL, 2 harness error, 3 BLOCKED. BLOCKED is not a pass.
+.PHONY: vm-acceptance vm-acceptance-list vm-acceptance-status vm-acceptance-verify
+VM_ACCEPTANCE := $(ROOT)/tools/acceptance/vm_acceptance.py
+VM_CASE ?= live-boot
+VM_ACCEPTANCE_ARGS ?=
+
+vm-acceptance: release-data
+	@test -x $(VM_ACCEPTANCE) || { echo "Missing VM acceptance harness: $(VM_ACCEPTANCE)" >&2; exit 1; }
+	@test -f $(ROOT)/$(ISO_NAME) || { echo "Missing artifact: $(ROOT)/$(ISO_NAME)" >&2; exit 1; }
+	$(VM_ACCEPTANCE) --version $(VERSION) run --case $(VM_CASE) --artifact $(ROOT)/$(ISO_NAME) $(VM_ACCEPTANCE_ARGS)
+
+vm-acceptance-list:
+	@$(VM_ACCEPTANCE) list
+
+vm-acceptance-status:
+	@$(VM_ACCEPTANCE) --version $(VERSION) status
+
+# Re-reads every receipt, every evidence byte and the chain that links the runs.
+vm-acceptance-verify:
+	@$(VM_ACCEPTANCE) --version $(VERSION) verify --all
 
 deps:
 	sudo apt-get update
@@ -145,19 +260,29 @@ packages: $(PACKAGES_STAMP)
 # was itself stale. A single source of truth that a human maintains is the same
 # bug with one fewer copy, so the build stamps it now.
 stamp-version:
-	@printf '%s\n' '$(VERSION)' > $(ROOT)/packages/shadowfetch-branding/data/usr/share/shadowfetch/version
-	@sed -i -E 's/[0-9]+\.[0-9]+\.[0-9]+/$(VERSION)/g' \
-		$(ROOT)/packages/shadowfetch-branding/data/usr/share/shadowfetch/os-release.shadowfetch
-	@for f in $(ROOT)/packages/shadowfetch-themes/data/usr/share/sddm/themes/umbra/metadata.desktop $(ROOT)/packages/shadowfetch-defaults/data/usr/share/doc/shadowfetch/LICENSES.md $(ROOT)/packages/shadowfetch-defaults/data/usr/share/doc/shadowfetch/SOURCES.md $(ROOT)/packages/shadowfetch-defaults/data/usr/bin/shadowfetch-element $(ROOT)/packages/shadowfetch-fireline/data/usr/bin/shadowfetch-firebreak; do \
-		sed -i -E 's/\b[0-9]+\.[0-9]+\.[0-9]+\b/$(VERSION)/g' "$$f"; \
-	done
-	@echo ">>> stamped version $(VERSION) into branding, themes, docs and CLI surfaces"
+	python3 tools/stamp_version.py "$(VERSION)" --outstanding-ok
 
-$(PACKAGES_STAMP): stamp-version
+# Fetch the pinned ShadowCode release into build/cache/shadowcode/<version>/,
+# authenticate it against the vendored upstream key and the pin, and stage the
+# .deb as build/shadow-code_<version>_amd64.deb. Idempotent, and offline once
+# the cache holds the assets. See vendor/shadowcode/README.md.
+shadowcode:
+	@test -n "$(SHADOWCODE_DEB)" || { echo "tools/release/shadowcode.toml is unreadable; cannot name the ShadowCode .deb" >&2; exit 1; }
+	python3 $(SHADOWCODE_FETCH)
+
+# Host-side smoke of the verified .deb: extract, ldd, --version. No VM, no install.
+shadowcode-smoke: shadowcode
+	python3 $(ROOT)/tools/shadowcode_smoke.py
+
+$(PACKAGES_STAMP): stamp-version shadowcode
 	@mkdir -p $(BUILD_DIR)
 	@for pkg in $(PACKAGES); do \
 		echo ">>> Building $$pkg" ; \
-		( cd $(ROOT)/packages/$$pkg && dpkg-buildpackage -us -uc -b ) || exit 1 ; \
+		if [ "$$pkg" = shadowfetch-drkonqi-pickup ]; then \
+			bash $(ROOT)/tools/build_drkonqi_pickup.sh --build || exit 1 ; \
+		else \
+			( cd $(ROOT)/packages/$$pkg && dpkg-buildpackage -us -uc -b ) || exit 1 ; \
+		fi ; \
 		mv $(ROOT)/packages/*.deb $(BUILD_DIR)/ 2>/dev/null || true ; \
 		mv $(ROOT)/packages/*.changes $(ROOT)/packages/*.buildinfo $(BUILD_DIR)/ 2>/dev/null || true ; \
 	done
@@ -200,15 +325,29 @@ repo: packages
 		( cd $(BUILD_DIR)/src && dpkg-source -b $$pkg ) || exit 1 ; \
 		GNUPGHOME=$(BUILDER_HOME)/.gnupg debsign --no-conf -k$(REPO_KEY_ID) \
 			$(BUILD_DIR)/src/$${pkg}_$${version}.dsc || exit 1 ; \
+		retained=$(ROOT)/vendor/release-signatures/$${pkg}_$${version}.dsc ; \
+		if [ -f "$$retained" ]; then \
+			GNUPGHOME=$(BUILDER_HOME)/.gnupg python3 $(ROOT)/tools/retain_source_signature.py \
+				$(BUILD_DIR)/src/$${pkg}_$${version}.dsc "$$retained" || exit 1 ; \
+		fi ; \
 		rm -rf $(BUILD_DIR)/src/$$pkg ; \
 		$(REPREPRO) -b $(REPO_DIR) -T dsc remove $(CODENAME) $$pkg >/dev/null 2>&1 || true ; \
 	done
 	@for dsc in $(BUILD_DIR)/src/*.dsc; do \
 		$(REPREPRO) -b $(REPO_DIR) includedsc $(CODENAME) $$dsc ; \
 	done
-	@for deb in $(RELEASE_DEBS); do \
+	@for deb in $(filter-out $(SHADOWCODE_DEB),$(RELEASE_DEBS)); do \
 		$(REPREPRO) -b $(REPO_DIR) includedeb $(CODENAME) $$deb ; \
 	done
+# ShadowCode's control file has no Section, and reprepro skips such a package
+# ("No section given") rather than guessing, so it is given one here -- the
+# .deb bytes are untouched, only the index record carries Section: devel. It
+# has no .dsc: nothing here builds it. Its release's runtime-sources tarball and
+# signed metadata are published under pool/third-party-source/ instead, which
+# the publisher uploads with the rest of pool/ (vendor/shadowcode/README.md).
+	@python3 $(SHADOWCODE_FETCH) --offline >/dev/null
+	@$(REPREPRO) -b $(REPO_DIR) -S devel -P optional includedeb $(CODENAME) $(SHADOWCODE_DEB) || exit 1
+	@set -o pipefail; python3 $(SHADOWCODE_FETCH) --offline --stage-sources $(REPO_DIR)/pool/third-party-source | tail -n 2
 	@tmp=$$(mktemp -d) ; \
 		trap 'rm -rf -- "$$tmp"' EXIT ; \
 		for deb in $(RELEASE_DEBS); do dpkg-deb -f "$$deb" Package; done | sort -u > "$$tmp/expected-binary" ; \
@@ -222,6 +361,44 @@ repo: packages
 	@echo ">>> Repo built at $(REPO_DIR). Contents:"
 	@$(REPREPRO) -b $(REPO_DIR) list $(CODENAME)
 
+# Re-sign the repository indices in place: same pool, same packages, fresh
+# Date/Valid-Until. This is what to run when the published metadata is
+# approaching expiry -- it rebuilds no package and no ISO. Publish the
+# resulting dists/ afterwards.
+refresh-index:
+	@test -d $(REPO_DIR)/db || { echo "No repository database at $(REPO_DIR). Run 'make repo' first." >&2; exit 1; }
+	@test -d $(REPO_DIR)/pool || { echo "No pool at $(REPO_DIR)/pool; refusing to export an empty repository." >&2; exit 1; }
+	@before=$$($(REPREPRO) -b $(REPO_DIR) list $(CODENAME) | sort) ; \
+	printf '%s\n' \
+		'Origin: Shadowfetch' \
+		'Label: Shadowfetch' \
+		'Codename: $(CODENAME)' \
+		'Architectures: amd64 source' \
+		'Components: main' \
+		'Description: Shadowfetch Linux package repository' \
+		'ValidFor: $(REPO_VALID_FOR)' \
+		'DebIndices: Packages Release . .gz' \
+		'DscIndices: Sources Release . .gz' \
+		'SignWith: $(REPO_KEY_ID)' \
+		> $(REPO_DIR)/conf/distributions ; \
+	$(REPREPRO) -b $(REPO_DIR) export $(CODENAME) ; \
+	after=$$($(REPREPRO) -b $(REPO_DIR) list $(CODENAME) | sort) ; \
+	[ "$$before" = "$$after" ] || { echo 'Package list changed during a metadata refresh; refusing.' >&2; exit 1; }
+	@$(GPG) --armor --export $(REPO_KEY_ID) > $(REPO_DIR)/shadowfetch.gpg.asc
+	@$(MAKE) --no-print-directory check-index
+	@echo ">>> Indices re-signed in $(REPO_DIR)/dists. Publish dists/ (and shadowfetch.gpg.asc) to make it live."
+
+# Fail if the local index is already expired or expires too soon. Runs on
+# its own so it can be used as a monitoring check.
+check-index:
+	@python3 -c 'import email.utils, sys, time; \
+	  path = "$(REPO_DIR)/dists/$(CODENAME)/Release"; \
+	  head = dict(l.split(": ", 1) for l in open(path) if ": " in l and not l.startswith(" ")); \
+	  raw = head["Valid-Until"].strip(); \
+	  left = email.utils.mktime_tz(email.utils.parsedate_tz(raw)) - time.time(); \
+	  sys.stderr.write(">>> %s Valid-Until %s (%.1f days remaining)\n" % ("$(CODENAME)", raw, left / 86400.0)); \
+	  sys.exit(0 if left > $(REPO_MIN_VALID_FOR_SECONDS) else 1)'
+
 iso: repo
 # A release build starts without any prior image or verification sidecars. If
 # live-build fails later, no stale ISO can be mistaken for this invocation.
@@ -231,6 +408,22 @@ iso: repo
 	@mkdir -p $(LB_DIR)/config/archives
 	@$(GPG) --dearmor < $(REPO_DIR)/shadowfetch.gpg.asc > $(LB_DIR)/config/archives/shadowfetch.key.chroot
 	@cp $(LB_DIR)/config/archives/shadowfetch.key.chroot $(LB_DIR)/config/archives/shadowfetch.key.binary
+# W-19: the apt source entries name the repository key by path
+# (signed-by=/usr/share/keyrings/shadowfetch.gpg) instead of trusting the
+# transport with [trusted=yes], so that file has to exist in the chroot
+# BEFORE live-build's first `apt-get update`, which runs inside
+# lb_chroot_archives -- earlier than hooks, includes.chroot or any package
+# install. config/archives/*.deb is the one live-build slot that installs
+# into the chroot ahead of that update ("Check local keyring packages"),
+# and the package it installs is also what carries the key into the
+# squashfs for the installed system. Same key, same path, one source of
+# truth: repo/shadowfetch.gpg.asc, which is what reprepro signs with.
+	@rm -rf $(BUILD_DIR)/archive-keyring
+	@mkdir -p $(BUILD_DIR)/archive-keyring/DEBIAN $(BUILD_DIR)/archive-keyring/usr/share/keyrings
+	@cp $(LB_DIR)/config/archives/shadowfetch.key.chroot $(BUILD_DIR)/archive-keyring/usr/share/keyrings/shadowfetch.gpg
+	@chmod 0644 $(BUILD_DIR)/archive-keyring/usr/share/keyrings/shadowfetch.gpg
+	@printf 'Package: shadowfetch-archive-keyring\nVersion: %s\nArchitecture: all\nSection: misc\nPriority: important\nMaintainer: Shadowfetch Project <signing@shadowfetch.com>\nDescription: GnuPG archive key for the Shadowfetch APT repository\n Ships /usr/share/keyrings/shadowfetch.gpg, the key named by signed-by=\n in every Shadowfetch apt source entry.\n' '$(VERSION)' > $(BUILD_DIR)/archive-keyring/DEBIAN/control
+	@dpkg-deb --root-owner-group --build $(BUILD_DIR)/archive-keyring $(LB_DIR)/config/archives/shadowfetch-archive-keyring.deb
 # Clean the prior live-build output.
 	@cd $(LB_DIR) && sudo lb clean
 	# live-build caches archives by package name and version. During release QA,
@@ -305,10 +498,10 @@ iso: repo
 	@$(MAKE) sign
 	@$(MAKE) iso-gate
 
-iso-gate:
+iso-gate: release-data
 	@mkdir -p $(dir $(ISO_GATE_LOG))
 	@test -x $(ISO_GATE) || { echo "Missing ISO gate: $(ISO_GATE)" >&2; exit 1; }
-	@set -o pipefail; $(ISO_GATE) 2>&1 | tee $(ISO_GATE_LOG)
+	@set -o pipefail; $(ISO_GATE) --version $(VERSION) 2>&1 | tee $(ISO_GATE_LOG)
 
 # Detached GPG signature so downloaders can verify with: gpg --verify <iso>.asc
 sign:
@@ -323,31 +516,11 @@ pre-release-check: iso-gate
 	@ROOT=$(ROOT) CODENAME=$(CODENAME) REPO_DIR=$(REPO_DIR) REPO_MIN_VALID_FOR_SECONDS=$(REPO_MIN_VALID_FOR_SECONDS) \
 		$(ROOT)/tools/pre_release_check.sh
 
-# Upload ISO + APT repo to R2 via aws-cli (R2's S3-compatible API).
-# Requires: brew install awscli, and an R2 API token from the Cloudflare
-# dashboard (R2 → Manage R2 API Tokens → Create) exported as:
-#   AWS_ACCESS_KEY_ID=<R2 Access Key ID>
-#   AWS_SECRET_ACCESS_KEY=<R2 Secret Access Key>
-# aws-cli handles multipart automatically, so the 2.9 GB ISO uploads fine.
+# Publish only the accepted artifact from the authorized Linux source tree.
+# The publisher preserves historical ISO/package objects, verifies signatures,
+# and writes signed APT InRelease last. Credentials are process environment only.
 publish: pre-release-check
-	@command -v aws >/dev/null || { echo "aws not installed. Run: brew install awscli" >&2; exit 1; }
-	@test -n "$$AWS_ACCESS_KEY_ID" || { echo "AWS_ACCESS_KEY_ID not set (use your R2 API token Access Key ID)" >&2; exit 1; }
-	@test -n "$$AWS_SECRET_ACCESS_KEY" || { echo "AWS_SECRET_ACCESS_KEY not set (use your R2 API token Secret Access Key)" >&2; exit 1; }
-	@if [ ! -f $(ROOT)/$(ISO_NAME) ]; then echo "No ISO to publish ($(ROOT)/$(ISO_NAME))" >&2; exit 1; fi
-	@if [ ! -f $(ROOT)/$(ISO_NAME).asc ]; then echo "No signature ($(ROOT)/$(ISO_NAME).asc) — run 'make sign'" >&2; exit 1; fi
-	@echo ">>> Uploading small files first (sha256, signature, GPG key)"
-	@aws --endpoint-url=$(R2_ENDPOINT) --region=$(R2_REGION) s3 cp $(ROOT)/$(ISO_NAME).sha256 s3://$(R2_BUCKET)/releases/$(ISO_NAME).sha256 --content-type "text/plain"
-	@aws --endpoint-url=$(R2_ENDPOINT) --region=$(R2_REGION) s3 cp $(ROOT)/$(ISO_NAME).asc    s3://$(R2_BUCKET)/releases/$(ISO_NAME).asc    --content-type "application/pgp-signature"
-	@aws --endpoint-url=$(R2_ENDPOINT) --region=$(R2_REGION) s3 cp $(REPO_DIR)/shadowfetch.gpg.asc s3://$(R2_BUCKET)/shadowfetch.gpg.asc --content-type "application/pgp-keys"
-	@echo ">>> Mirroring APT repo (dists/ + pool/) to R2 apt/"
-	@aws --endpoint-url=$(R2_ENDPOINT) --region=$(R2_REGION) s3 sync $(REPO_DIR)/dists s3://$(R2_BUCKET)/apt/dists --delete
-	@aws --endpoint-url=$(R2_ENDPOINT) --region=$(R2_REGION) s3 sync $(REPO_DIR)/pool  s3://$(R2_BUCKET)/apt/pool  --delete
-	@echo ">>> Uploading ISO ($(ISO_NAME), $$(du -h $(ROOT)/$(ISO_NAME) | cut -f1), multipart). Progress below."
-	@aws --endpoint-url=$(R2_ENDPOINT) --region=$(R2_REGION) s3 cp $(ROOT)/$(ISO_NAME) s3://$(R2_BUCKET)/releases/$(ISO_NAME) --content-type "application/x-iso9660-image"
-	@echo ">>> Done. Verify:"
-	@echo "    open $(PUBLIC_SITE)/"
-	@echo "    curl -I  $(ARTIFACT_BASE)/download/$(ISO_NAME)"
-	@echo "    curl -sI $(ARTIFACT_BASE)/apt/dists/$(CODENAME)/InRelease"
+	@python3 $(ROOT)/tools/publish_release_4_0_0.py --apply
 
 qemu:
 	qemu-system-x86_64 \
@@ -359,37 +532,27 @@ qemu:
 		-drive file=$(ROOT)/$(ISO_NAME),media=cdrom,readonly=on \
 		-boot d
 
-# ---- Mac-side deploy flow ----
-# Run these from your Mac (where wrangler is logged in) to ship a release
-# that was built on $(LINUX_HOST).
-
-# Pull the latest ISO + checksum + signature + reprepro repo back from the
-# Linux build box. Idempotent.
+# Pull a read-only local copy of already built release artifacts for inspection.
 sync-from-linux:
-	@echo ">>> Pulling ISO + repo from $(LINUX_HOST):$(LINUX_PATH)"
-	@rsync -avzhP $(LINUX_HOST):$(LINUX_PATH)/shadowfetch-*.iso $(ROOT)/ 2>/dev/null || echo "(no ISO yet on Linux box)"
-	@rsync -avzhP $(LINUX_HOST):$(LINUX_PATH)/shadowfetch-*.iso.sha256 $(ROOT)/ 2>/dev/null || true
-	@rsync -avzhP $(LINUX_HOST):$(LINUX_PATH)/shadowfetch-*.iso.asc $(ROOT)/ 2>/dev/null || true
-	@rsync -avzh --delete $(LINUX_HOST):$(LINUX_PATH)/repo/ $(REPO_DIR)/
-	@ls -lh $(ROOT)/shadowfetch-*.iso 2>/dev/null || echo "(no ISO present)"
+	@rsync -avzhP $(LINUX_HOST):$(LINUX_PATH)/$(ISO_NAME) $(ROOT)/
+	@rsync -avzhP $(LINUX_HOST):$(LINUX_PATH)/$(ISO_NAME).sha256 $(ROOT)/
+	@rsync -avzhP $(LINUX_HOST):$(LINUX_PATH)/$(ISO_NAME).asc $(ROOT)/
 
-# Deploy the shadowfetch-linux Worker. Requires `wrangler login` (one time) or CLOUDFLARE_API_TOKEN.
+# Artifact routing is stable across distro releases. Deploying a Worker is a
+# separate reviewed change, never an implicit side effect of publishing an ISO.
 deploy-worker:
-	@command -v wrangler >/dev/null || { echo "wrangler not installed. Run: brew install cloudflare-wrangler2" >&2; exit 1; }
-	@cd $(ROOT)/web/shadowfetch-linux-worker && wrangler deploy
+	@echo "Artifact routing is unchanged. Review any Worker change separately." >&2
+	@exit 1
 
-# Full Mac-side ship: pull artifacts, publish to R2, deploy Worker.
-ship: sync-from-linux publish deploy-worker
-	@echo ""
-	@echo ">>> SHIPPED. Verify:"
-	@echo "    open $(PUBLIC_SITE)/"
-	@echo "    curl -I $(ARTIFACT_BASE)/download/$(ISO_NAME)"
-	@echo "    curl -sI $(ARTIFACT_BASE)/apt/dists/$(CODENAME)/InRelease"
+ship: publish
+	@echo ">>> Accepted artifacts published. Complete public byte verification, GitHub release, and canonical Linux website deployment per RELEASE-$(VERSION).md."
 
 clean:
 	-cd $(LB_DIR) && sudo lb clean
 	-rm -rf $(BUILD_DIR)
 	-rm -f $(LB_DIR)/config/archives/shadowfetch.key.*
+	-rm -f $(LB_DIR)/config/archives/shadowfetch-archive-keyring.deb
+	-rm -rf $(BUILD_DIR)/archive-keyring
 
 distclean: clean
 	-rm -rf $(REPO_DIR)/db $(REPO_DIR)/dists $(REPO_DIR)/pool $(REPO_DIR)/conf

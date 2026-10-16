@@ -1,3 +1,45 @@
+shadowfetch-themes (5.0.1-1) umbra; urgency=medium
+
+  * The umbra SDDM theme metadata reports Version=5.0.1. No visual change.
+
+ -- Shadowfetch Project <signing@shadowfetch.com>  Wed, 30 Sep 2026 23:15:00 -0400
+
+shadowfetch-themes (5.0.0-1) umbra; urgency=medium
+
+  * ShadowCode: one look replaces Fire and Ice. ShadowfetchDark.colors,
+    ShadowfetchUmbra.colorscheme, org.shadowfetch.dark and the umbra SDDM
+    theme keep their ids so 4.1 configurations still resolve, are restyled
+    to ShadowCode gold (#F2B33D) and brushed-steel silver on near-black, and
+    display as "ShadowCode". The splash shows the two-tone wordmark.
+  * Remove ShadowfetchIce.colors, ShadowfetchGlacier.colorscheme and the
+    org.shadowfetch.ice look-and-feel. Desktops that used them are moved
+    once at login by /usr/lib/shadowfetch/look-migrate.sh
+    (shadowfetch-defaults).
+  * Move the warning colour from amber #E0A33A to #E68F2E so it no longer
+    reads as the brighter ShadowCode gold.
+
+ -- Shadowfetch Project <signing@shadowfetch.com>  Mon, 28 Sep 2026 18:30:00 -0400
+
+shadowfetch-themes (4.1.0-1) umbra; urgency=medium
+
+  * Fix reversed RGB in the Ice palette. ShadowfetchIce's ForegroundNegative
+    and ForegroundNeutral were blue and light blue where red and amber
+    belong, and Konsole's Glacier Color1 and Color1Intense -- the ANSI red a
+    terminal uses for errors -- rendered blue.
+  * The Ice look-and-feel selected the dark splash theme and the dark
+    look-and-feel package, and named itself "Shadowfetch Umbra". It selects
+    its own now.
+  * Report 4.1.0 in the Umbra SDDM theme metadata.
+
+ -- Shadowfetch Project <signing@shadowfetch.com>  Wed, 09 Sep 2026 18:28:58 -0400
+
+shadowfetch-themes (4.0.0-1) umbra; urgency=medium
+
+  * Shadowfetch Linux 4.0 Mission Control release.
+  * Integrate persistent missions, scoped execution and featured Grok Bot setup.
+
+ -- Shadowfetch Project <signing@shadowfetch.com>  Sat, 05 Sep 2026 03:00:00 +0000
+
 shadowfetch-themes (3.5.0-1) umbra; urgency=medium
 
   * Shadowfetch Linux 3.5.0 flagship Fire and Ice Workbench release.

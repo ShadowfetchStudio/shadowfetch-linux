@@ -1,17 +1,6 @@
-"""The Control Center shell: eight fixed sections, deep-link routing, one
-window.
+"""Native Mission Control shell, featured Grok Bot and system care pages.
 
-Sidebar order is fixed - Guide / Workbench / Ignite / Watch / Recover / Local AI /
-Drivers / Software & Updates (subtitle "Updates & bundles", the design's own
-fallback name so the headline safety feature never hides behind a word
-that means "app store").
-
-Routing: `shadowfetch-control --page <section>[:<tab>][:point=N]`.  A
-second launch activates the running window over the session bus instead of
-opening another — every deep link (Welcome, Firewatch empty-state, Phoenix
-overlay banner, Fireproof notification, hwscan fix buttons) lands in one
-window.  Only Software & Updates ever shows a badge (pending-update count
-from fireproofd).
+Single-instance deep links route over the local session bus.
 """
 
 import sys
@@ -24,47 +13,22 @@ from PyQt6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from sfcc import busutil, theme
-from sfcc.agents_page import AgentsPage
-from sfcc.drivers_page import DriversPage
-from sfcc.ember_page import EmberPage
-from sfcc.firewatch_page import FirewatchPage
-from sfcc.guide_page import GuidePage
-from sfcc.phoenix_page import PhoenixPage
-from sfcc.software_page import SoftwarePage
-from sfcc.workbench_page import WorkbenchPage
+from sfcc import busutil, pages, theme
+from sfcc.pages import PageContext
 from sfcc.theme import label
 
 BUS_NAME = "com.shadowfetch.ControlCenter"
 OBJ_PATH = "/com/shadowfetch/ControlCenter"
 
-SECTIONS = [
-    ("guide", "Guide", "System Passport"),
-    ("workbench", "Workbench", "Fire & Ice projects"),
-    ("ignite", "Ignite", None),
-    ("watch", "Watch", None),
-    ("recover", "Recover", None),
-    ("local-ai", "Local AI", "Buzz & models"),
-    ("drivers", "Drivers", None),
-    ("software", "Software & Updates", "Updates & bundles"),
-]
-
-ALIASES = {
-    "guide": "guide", "passport": "guide", "system-passport": "guide",
-    "workbench": "workbench", "forge": "workbench", "projects": "workbench",
-    "ignite": "ignite", "ember": "ignite",
-    "watch": "watch", "firewatch": "watch",
-    "recover": "recover", "phoenix": "recover", "recovery": "recover",
-    "local-ai": "local-ai", "agents": "local-ai", "ai": "local-ai", "buzz": "local-ai",
-    "drivers": "drivers",
-    "software": "software", "software-updates": "software",
-    "updates": "software", "bundles": "software",
-}
+# The sidebar, the pages behind it and every accepted route word all come from
+# sfcc.pages.REGISTRY. There is no second list here to keep in step with it.
+SECTIONS = pages.REGISTRY
 
 try:
     import dbus
@@ -97,7 +61,11 @@ class SidebarEntry(QWidget):
     def __init__(self, title: str, subtitle: str | None):
         super().__init__()
         self.setObjectName("sideItem")
-        self.setStyleSheet("background: transparent;")
+        # Scoped to this widget: a bare "background: transparent;" cascades to
+        # every child and, as a widget-level sheet, beats the application's
+        # QLabel#badge rule -- the update count then rendered as ink on the
+        # dark sidebar with no gold pill (5.0.0 VM QA, 2abd1f6f).
+        self.setStyleSheet("QWidget#sideItem { background: transparent; }")
         lay = QHBoxLayout(self)
         lay.setContentsMargins(10, 6, 10, 6)
         lay.setSpacing(6)
@@ -114,6 +82,7 @@ class SidebarEntry(QWidget):
         lay.addLayout(col, 1)
         self.badge = QLabel("")
         self.badge.setObjectName("badge")
+        self.badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.badge.hide()
         lay.addWidget(self.badge)
 
@@ -128,14 +97,15 @@ class SidebarEntry(QWidget):
 class ControlCenterWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Shadowfetch Control Center")
-        self.setMinimumSize(1000, 660)
-        self.resize(1080, 720)
+        self.setWindowTitle("Shadowfetch · Mission Control")
+        self.setMinimumSize(960, 640)
+        self.resize(1200, 720)
         icon = QIcon.fromTheme("shadowfetch")
         if not icon.isNull():
             self.setWindowIcon(icon)
         self.setStyleSheet(theme.STYLESHEET)
 
+        self.version = busutil.sf_version()
         self.firewatch = busutil.FirewatchClient(self)
 
         root = QHBoxLayout(self)
@@ -147,8 +117,11 @@ class ControlCenterWindow(QWidget):
         side.setContentsMargins(0, 0, 0, 0)
         side.setSpacing(0)
         side_wrap = QWidget()
-        side_wrap.setStyleSheet("background: #101114;")
-        side_wrap.setFixedWidth(240)
+        # Scoped for the same reason as SidebarEntry's sheet: unscoped, this
+        # ancestor rule also painted the badge (see SidebarEntry).
+        side_wrap.setObjectName("sideWrap")
+        side_wrap.setStyleSheet(f"QWidget#sideWrap {{ background: {theme.SIDEBAR}; }}")
+        side_wrap.setFixedWidth(216)
         side_wrap.setLayout(side)
 
         brand = QLabel("Shadowfetch")
@@ -156,7 +129,7 @@ class ControlCenterWindow(QWidget):
                             f"font-weight: 700; color: {theme.GOLD};"
                             "padding: 16px 16px 2px 16px;")
         side.addWidget(brand)
-        brand_sub = QLabel("Control Center")
+        brand_sub = QLabel("MISSION CONTROL  /  " + ".".join(self.version.split(".")[:2]))
         brand_sub.setStyleSheet(f"background: transparent; color: {theme.MUTED};"
                                 "padding: 0 16px 10px 16px;")
         side.addWidget(brand_sub)
@@ -164,16 +137,16 @@ class ControlCenterWindow(QWidget):
         self.sidebar = QListWidget()
         self.sidebar.setObjectName("sidebar")
         self._entries: list[SidebarEntry] = []
-        for _key, title, subtitle in SECTIONS:
+        for section in SECTIONS:
             item = QListWidgetItem()
-            entry = SidebarEntry(title, subtitle)
-            item.setSizeHint(QSize(220, 52 if subtitle else 42))
+            entry = SidebarEntry(section.title, section.subtitle)
+            item.setSizeHint(QSize(200, 46 if section.subtitle else 36))
             self.sidebar.addItem(item)
             self.sidebar.setItemWidget(item, entry)
             self._entries.append(entry)
         side.addWidget(self.sidebar, 1)
 
-        footer = QLabel(f"Shadowfetch Linux {busutil.sf_version()}\n"
+        footer = QLabel(f"Shadowfetch Linux {self.version}\n"
                         "Local-first · No account required")
         footer.setStyleSheet(f"background: transparent; color: {theme.MUTED};"
                              "font-size: 11px; padding: 10px 16px;")
@@ -195,16 +168,12 @@ class ControlCenterWindow(QWidget):
         content.addWidget(header)
 
         self.stack = QStackedWidget()
-        self.pages = [
-            GuidePage(self.open_route),
-            WorkbenchPage(),
-            EmberPage(self.firewatch, self.open_route),
-            FirewatchPage(self.firewatch),
-            PhoenixPage(),
-            AgentsPage(self.firewatch, self.open_route),
-            DriversPage(),
-            SoftwarePage(),
-        ]
+        # One context object per window, handed to every section. The shell
+        # knows nothing about what any individual page needs.
+        context = PageContext(open_route=self.open_route,
+                              firewatch=self.firewatch, version=self.version)
+        self.context = context
+        self.pages = [section.build(context) for section in SECTIONS]
         for page in self.pages:
             self.stack.addWidget(page)
         content.addWidget(self.stack, 1)
@@ -228,10 +197,22 @@ class ControlCenterWindow(QWidget):
         badge_timer.start()
 
     # ---- shell behaviour --------------------------------------------------
+    def closeEvent(self, event):
+        # The page supplies the verdict AND the sentence. The shell used to
+        # test one page's attribute name and then write the warning itself,
+        # so a second page with a reason to block had no way to say so.
+        for page in self.pages:
+            reason = pages.section_blocking_reason(page)
+            if reason:
+                event.ignore()
+                QMessageBox.warning(self, "This window is still busy", reason)
+                return
+        super().closeEvent(event)
+
     def _section_changed(self, row: int) -> None:
         if 0 <= row < len(self.pages):
             self.stack.setCurrentIndex(row)
-            self.page_title.setText(SECTIONS[row][1])
+            self.page_title.setText(SECTIONS[row].title)
 
     def _refresh_status(self) -> None:
         state, detail = busutil.system_summary()
@@ -243,27 +224,20 @@ class ControlCenterWindow(QWidget):
         self.status.setAccessibleName(f"{state}. {detail}")
 
     def _refresh_badge(self) -> None:
-        # Only Software & Updates ever shows a badge; fireproofd suppresses
-        # the count itself for a set the user already rolled back.
-        count = busutil.fireproof_updates()
-        index = next(i for i, (key, _title, _subtitle) in enumerate(SECTIONS)
-                     if key == "software")
-        self._entries[index].set_badge(count if count else None)
+        # Asked OF each page. The shell no longer knows which section counts
+        # something, so a page that grows a badge does not need a change here,
+        # and the `next(...)` that raised StopIteration when its hard-coded key
+        # left SECTIONS is gone.
+        for entry, page in zip(self._entries, self.pages):
+            entry.set_badge(pages.section_badge(page))
 
     def open_route(self, route: str) -> None:
-        parts = [p for p in str(route).split(":") if p]
-        if not parts:
+        resolved = pages.resolve(route)
+        if resolved is None:
             return
-        section = ALIASES.get(parts[0].strip().lower())
-        if section is None:
-            return
-        index = next(i for i, (key, _t, _s) in enumerate(SECTIONS)
-                     if key == section)
+        index, rest = resolved
         self.sidebar.setCurrentRow(index)
-        page = self.pages[index]
-        rest = parts[1:]
-        if rest and hasattr(page, "route"):
-            page.route(rest)
+        pages.section_route(self.pages[index], rest)
 
 
 def _parse_page(argv: list[str]) -> str:
@@ -272,11 +246,23 @@ def _parse_page(argv: list[str]) -> str:
             return argv[i + 1]
         if arg.startswith("--page="):
             return arg.split("=", 1)[1]
-    return ""
+    return "missions"
 
 
 def run(argv: list[str]) -> int:
     route = _parse_page(argv)
+    # Encode paths for the existing single-instance D-Bus route. Shell and
+    # route separators in filenames never become command syntax.
+    from urllib.parse import quote
+    if "--workspace" in argv:
+        index = argv.index("--workspace")
+        if index + 1 < len(argv):
+            kind = "code"
+            if "--kind" in argv and argv.index("--kind") + 1 < len(argv):
+                candidate = argv[argv.index("--kind") + 1]
+                if candidate in ("code", "report", "media"):
+                    kind = candidate
+            route = "missions:new:workspace=" + quote(argv[index + 1], safe="") + ":kind=" + kind
 
     bus = busutil.session_bus()
     bus_name = None

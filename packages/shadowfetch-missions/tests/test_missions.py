@@ -1,0 +1,986 @@
+"""State, real process cancellation, scope, receipts and workflow regressions.
+
+Model outputs are controlled fixtures in unit tests, clearly separate from the
+release's required live Codex inference smoke tests. No mocked result is
+reported as a successful model integration.
+"""
+import concurrent.futures
+import contextlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+
+import mission_approvals
+
+import mission_states
+from unittest.mock import patch
+
+SOURCE = Path(__file__).resolve().parents[1] / "data/usr/lib/shadowfetch/missions/sf_missions.py"
+spec = importlib.util.spec_from_file_location("sf_missions", SOURCE)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+# sf_missions puts its own directory on sys.path, so the provider adapter
+# is importable here for the tests that control a provider binary.
+import sf_provider_codex as codex_adapter
+import sf_providers
+
+class MissionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp.name).resolve()
+        self.ws = self.base / "Workspaces" / "example"
+        self.ws.mkdir(parents=True)
+        (self.ws / "facts.md").write_text("The launch is Friday.\nThe release contains three workflows.\n")
+        self.env = patch.dict(os.environ, {"SHADOWFETCH_AGENT_WORKSPACES": str(self.ws.parent), "SHADOWFETCH_MISSIONS_STATE": str(self.base / "state")})
+        self.env.start()
+        self.store = m.Store()
+    def tearDown(self):
+        self.env.stop()
+        self.temp.cleanup()
+    def create(self, **kwargs):
+        # provider_id is named rather than inferred: more than one provider
+        # serves this capability now, and the engine refuses to choose for a
+        # caller who did not. Which provider runs is not what these tests are
+        # about -- that refusal is proven in test_provider_conformance -- so
+        # saying it here keeps them independent of how many providers ship.
+        values = dict(kind="report", provider_id="codex", workspace_value="example", title="Launch report", prompt="Summarize the launch", inputs=["facts.md"], network="allow")
+        values.update(kwargs)
+        return self.store.create(**values)
+
+    def approved(self, **kwargs):
+        """A mission a person has approved. Most tests here are about execution,
+        not about the approval gate, so they say so in one line rather than
+        having the harness approve everything silently."""
+        mission = self.create(**kwargs)
+        mission_approvals.approve(self.store, mission)
+        return mission
+    def test_durable_queue_across_connections(self):
+        mission = self.create()
+        self.assertEqual(m.Store().get(mission["id"])["state"], "queued")
+        self.assertEqual(self.store.events(mission["id"])[0]["event"], "queued")
+        self.assertEqual(self.store.db_path.stat().st_mode & 0o777, 0o600)
+    def test_parallel_creates_have_no_lost_updates(self):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+            items = list(pool.map(lambda i:self.create(title="Task " + str(i)), range(80)))
+        self.assertEqual(len({item["id"] for item in items}), 80)
+        self.assertEqual(len(self.store.list()), 80)
+    def test_scope_rejects_symlink_workspace_and_inputs(self):
+        outside = self.base / "outside"
+        outside.mkdir()
+        (self.ws.parent / "linked").symlink_to(outside)
+        with self.assertRaises(m.MissionError):
+            self.create(workspace_value="linked")
+        (self.ws / "escape.md").symlink_to(self.base / "secret.md")
+        (self.base / "secret.md").write_text("secret")
+        for path in ("../secret.md", "/etc/passwd", "escape.md"):
+            with self.subTest(path=path), self.assertRaises(m.MissionError):
+                self.create(inputs=[path])
+    def test_controller_cannot_live_in_workspace(self):
+        with self.assertRaises(m.MissionError):
+            m.Store(self.ws / "state")
+    def test_code_requires_explicit_tests_and_cloud_network(self):
+        with self.assertRaises(m.MissionError):
+            self.create(kind="code", test=None)
+        with self.assertRaises(m.MissionError):
+            self.create(kind="code", runtime="codex", network="none", test=["python3", "tests.py"])
+    def test_report_real_checkpoint_diff_receipt_and_undo(self):
+        mission = self.approved()
+        with patch.object(m.Executor, "agent_turn", return_value="The launch is Friday. [S1:L1]\nThe release contains three workflows. [S1:L2]"):
+            result = m.run_mission(self.store, mission["id"])
+        self.assertEqual(result["state"], "waiting-review", result["error"])
+        self.assertTrue(result["checkpoint"])
+        self.assertEqual(len(result["artifacts"]), 2)
+        receipt = json.loads(Path(result["receipt"]).read_text())
+        self.assertTrue(all(m.digest(a["path"]) == a["sha256"] for a in receipt["artifacts"]))
+        self.assertIn("report.md", Path(receipt["diff"]).read_text())
+        m.review(self.store, mission["id"], "undo")
+        self.assertFalse((self.ws / "mission-output").exists())
+        self.assertEqual((self.ws / "facts.md").read_text().splitlines()[0], "The launch is Friday.")
+    def test_invalid_citation_does_not_publish_or_claim_success(self):
+        mission = self.approved()
+        with patch.object(m.Executor, "agent_turn", return_value="Invented fact. [S1:L99]"):
+            result = m.run_mission(self.store, mission["id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertFalse(result["artifacts"])
+        self.assertIn("invalid source citation", result["error"])
+        self.assertTrue(Path(result["receipt"]).is_file())
+    def test_pending_review_prevents_other_workspace_mutation(self):
+        first = self.approved()
+        with patch.object(m.Executor, "agent_turn", return_value="Friday. [S1:L1]"):
+            m.run_mission(self.store, first["id"])
+        second = self.approved()
+        with self.assertRaisesRegex(m.MissionError, "Review the previous"):
+            m.run_mission(self.store, second["id"])
+        self.assertEqual(self.store.get(second["id"])["state"], "queued")
+        m.review(self.store, first["id"], "accept")
+        with patch.object(m.Executor, "agent_turn", return_value="Friday. [S1:L1]"):
+            m.run_mission(self.store, second["id"])
+        with self.assertRaisesRegex(m.MissionError, "newer mission"):
+            m.review(self.store, first["id"], "undo")
+    def test_recovery_never_replays_interrupted_work(self):
+        mission = self.create()
+        mission_states.reach(self.store, mission["id"], "running", attempt=1)
+        with self.store.lock():
+            self.store.recover()
+        item = self.store.get(mission["id"])
+        self.assertEqual(item["state"], "failed")
+        self.assertIn("no automatic replay", item["error"])
+        self.store.retry(item["id"])
+        self.assertEqual(self.store.get(item["id"])["state"], "queued")
+    def test_retry_budget_is_bounded(self):
+        mission = self.create()
+        mission_states.reach(self.store, mission["id"], "failed", attempt=3)
+        with self.assertRaisesRegex(m.MissionError, "exhausted"):
+            self.store.retry(mission["id"])
+    def test_queued_cancellation_is_durable(self):
+        mission = self.approved()
+        self.store.cancel(mission["id"])
+        self.assertEqual(m.Store().get(mission["id"])["state"], "cancelled")
+        with self.assertRaises(m.MissionError):
+            m.run_mission(self.store, mission["id"])
+    def test_running_process_cancel_kills_child_group(self):
+        mission = self.create()
+        mission_states.reach(self.store, mission["id"], "running")
+        executor = m.Executor(self.store, self.store.get(mission["id"]))
+        marker = self.base / "should-not-exist"
+        script = "import time,pathlib;time.sleep(3);pathlib.Path(" + repr(str(marker)) + ").write_text('bad')"
+        timer = threading.Timer(.4, lambda:self.store.cancel(mission["id"]))
+        timer.start()
+        start = time.monotonic()
+        try:
+            with self.assertRaises(m.Cancelled):
+                executor.run_process([sys.executable, "-c", script], "cancellation", sandbox=False)
+        finally:
+            timer.join()
+        self.assertLess(time.monotonic() - start, 2)
+        self.assertFalse(marker.exists())
+    def test_removed_provider_and_model_selection_are_refused(self):
+        """Each of these has to be refused FOR ITSELF.
+
+        Naming no provider is ambiguous on its own now -- three of them serve
+        this capability -- so a bare assertRaises would pass on every retired
+        runtime without the runtime being looked at once. The runtimes are
+        therefore offered as the selection under test, with no provider, and
+        the refusal is read rather than merely counted.
+        """
+        for runtime in ("local", "shared", "offline"):
+            with self.subTest(runtime=runtime):
+                with self.assertRaises(m.MissionError) as caught:
+                    self.create(provider_id=None, runtime=runtime)
+                self.assertNotIn("name one with --provider", str(caught.exception),
+                                 "refused for ambiguity, not for the retired runtime")
+        with self.subTest(model="old-model"), self.assertRaises(m.MissionError):
+            self.create(model="old-model")
+
+    def test_a_model_is_the_provider_s_answer_and_its_shape_is_the_engine_s(self):
+        """The engine refused every model for every provider before asking one.
+
+        That was the honest answer while nothing could take a model, and a
+        refusal of the system's own capability once something could. The split
+        it leaves is deliberate: WHICH names exist is a provider fact, and how
+        long a name may be and what characters it may contain is not -- the
+        name becomes an argv element, so the engine still bounds the string.
+        """
+        # A provider that has models takes one, by its own rules.
+        mission = self.create(provider_id="claude", model="sonnet")
+        self.assertEqual(mission["config"]["model"], "sonnet")
+
+        # A provider that has none refuses in its own words, not the engine's.
+        with self.assertRaises(m.MissionError) as caught:
+            self.create(model="gpt-9")
+        self.assertIn("Codex", str(caught.exception))
+
+        # And the engine refuses a name no command line should carry, before
+        # any provider is asked to have an opinion about it.
+        for hostile in ("a" * 101, "sonnet; rm -rf /", "--dangerous", "a b",
+                        "model\nname"):
+            with self.subTest(model=hostile):
+                with self.assertRaises(m.MissionError) as caught:
+                    self.create(provider_id="claude", model=hostile)
+                self.assertIn("command line", str(caught.exception))
+
+    def test_codex_code_runs_actual_required_test(self):
+        (self.ws / "app.py").write_text("def add(a, b): return a - b\n")
+        mission = self.approved(kind="code", inputs=["app.py"], test=[sys.executable, "-c", "from app import add; assert add(2,3)==5"])
+        original = m.Executor.run_process
+        def fixture_codex(executor, prompt):
+            (executor.ws / "app.py").write_text("def add(a,b): return a+b\n")
+        def host_test(executor, command, label, **kwargs):
+            return original(executor, command, label, sandbox=False)
+        with patch.object(m.Executor, "agent_turn", fixture_codex), patch.object(m.Executor, "run_process", host_test):
+            result = m.run_mission(self.store, mission["id"])
+        self.assertEqual(result["state"], "waiting-review", result["error"])
+        receipt = json.loads(Path(result["receipt"]).read_text())
+        self.assertEqual([t["exit"] for t in receipt["tests"]], [0])
+        self.assertEqual(receipt["runtime"], "codex")
+        self.assertIn("return a+b", (self.ws / "app.py").read_text())
+    def test_resume_only_after_published_hash_verification(self):
+        mission = self.approved()
+        with patch.object(m.Executor, "agent_turn", return_value="Friday. [S1:L1]"):
+            result = m.run_mission(self.store, mission["id"])
+        # Stands in for "the report was published, then a later step failed" --
+        # running -> failed in the engine, unreachable from waiting-review here.
+        mission_states.fabricate(self.store, mission["id"], "failed")
+        self.store.retry(mission["id"])
+        with patch.object(m.Executor, "agent_turn", side_effect=AssertionError("must resume verified report")):
+            result = m.run_mission(self.store, mission["id"])
+        self.assertEqual(result["state"], "waiting-review", result["error"])
+        self.assertTrue(any(e["event"] == "step-resumed" for e in self.store.events(mission["id"])))
+    def test_changed_report_inputs_refuse_resume_and_preserve_manual_edits(self):
+        mission = self.approved()
+        with patch.object(m.Executor, "agent_turn", return_value="Friday. [S1:L1]"):
+            first = m.run_mission(self.store, mission["id"])
+        report_path = next(Path(path) for path in first["artifacts"] if path.endswith("report.md"))
+        report_before = report_path.read_text()
+        # Stands in for "the report was published, then a later step failed" --
+        # running -> failed in the engine, unreachable from waiting-review here.
+        mission_states.fabricate(self.store, mission["id"], "failed")
+        (self.ws / "facts.md").write_text("Updated launch is Saturday.\n")
+        self.store.retry(mission["id"])
+        with patch.object(m.Executor, "agent_turn", side_effect=AssertionError("must not replay inference")):
+            result = m.run_mission(self.store, mission["id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertIn("Source inputs changed", result["error"])
+        self.assertEqual(report_path.read_text(), report_before)
+        self.assertEqual((self.ws / "facts.md").read_text(), "Updated launch is Saturday.\n")
+        with self.assertRaisesRegex(m.MissionError, "changed after"):
+            m.review(self.store, mission["id"], "undo")
+        self.assertTrue(json.loads(Path(result["receipt"]).read_text())["recovery_index_preserved"])
+    def test_report_resume_retains_historical_codex_inference_provenance(self):
+        mission = self.approved()
+        # Controlled unit fixture; release integration uses a real native server.
+        original = {"provider": "codex", "model": None, "usage": {"output_tokens": 11}, "observed_at": "2026-09-05T00:00:00Z", "attempt": 1, "response_sha256": "a" * 64, "reused": False}
+        def inference(executor, *args, **kwargs):
+            executor.inferences.append(original.copy())
+            return "Friday. [S1:L1]"
+        with patch.object(m.Executor, "agent_turn", inference):
+            first = m.run_mission(self.store, mission["id"])
+        self.assertEqual(first["state"], "waiting-review")
+        provenance = self.store.step(mission["id"], "report-provenance")
+        for change_source in (False, True):
+            # Stands in for "the report was published, then a later step
+            # failed" -- running -> failed in the engine, unreachable from
+            # waiting-review here.
+            mission_states.fabricate(self.store, mission["id"], "failed")
+            self.store.retry(mission["id"])
+            if change_source:
+                (self.ws / "facts.md").write_text("A newer personal source edit.\n")
+            with patch.object(m.Executor, "agent_turn", side_effect=AssertionError("must not replay inference")):
+                result = m.run_mission(self.store, mission["id"])
+            self.assertEqual(result["state"], "failed" if change_source else "waiting-review")
+            receipt = json.loads(Path(result["receipt"]).read_text())
+            reused = receipt["inferences"][0]
+            for key in ("provider", "model", "usage", "observed_at", "attempt", "response_sha256"):
+                self.assertEqual(reused[key], original[key])
+            self.assertTrue(reused["reused"])
+            self.assertEqual(reused["original_report_attempt"], 1)
+            self.assertEqual(reused["original_report_published_at"], provenance["published_at"])
+            self.assertIn("Historical", reused["verification_scope"])
+            self.assertEqual(self.store.step(mission["id"], "report-provenance"), provenance)
+    def test_report_resume_refuses_missing_inference_provenance(self):
+        mission = self.approved()
+        with patch.object(m.Executor, "agent_turn", return_value="Friday. [S1:L1]"):
+            m.run_mission(self.store, mission["id"])
+        self.store.step(mission["id"], "report-provenance", {})
+        # Stands in for "the report was published, then a later step failed" --
+        # running -> failed in the engine, unreachable from waiting-review here.
+        mission_states.fabricate(self.store, mission["id"], "failed")
+        self.store.retry(mission["id"])
+        with patch.object(m.Executor, "agent_turn", side_effect=AssertionError("no repeat inference")):
+            result = m.run_mission(self.store, mission["id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertIn("no retained inference provenance", result["error"])
+    def test_missing_execution_baseline_does_not_claim_added_files(self):
+        mission = self.create()
+        executor = m.Executor(self.store, mission)
+        executor.receipt("cancelled", "Cancelled before execution")
+        diff = (self.store.directory(mission["id"]) / "changes.diff").read_text()
+        self.assertIn("No recorded execution baseline", diff)
+        self.assertNotIn("+ facts.md", diff)
+        self.assertNotIn("after/facts.md", diff)
+
+    def test_undo_refuses_newer_manual_file_changes(self):
+        mission = self.approved()
+        with patch.object(m.Executor, "agent_turn", return_value="Friday. [S1:L1]"):
+            m.run_mission(self.store, mission["id"])
+        (self.ws / "newer-manual.txt").write_text("keep me")
+        with self.assertRaisesRegex(m.MissionError, "changed after"):
+            m.review(self.store, mission["id"], "undo")
+        self.assertEqual((self.ws / "newer-manual.txt").read_text(), "keep me")
+    def test_code_cannot_rewrite_validation_to_pass(self):
+        (self.ws / "test_app.py").write_text("raise AssertionError('required behavior')\n")
+        mission = self.approved(kind="code", inputs=["test_app.py"], test=["python3", "test_app.py"])
+        def tamper(executor, prompt):
+            (executor.ws / "test_app.py").write_text("pass\n")
+        with patch.object(m.Executor, "agent_turn", tamper):
+            result = m.run_mission(self.store, mission["id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertIn("changed or removed a pre-existing test", result["error"])
+    def test_report_requires_explicit_cloud_permission(self):
+        with self.assertRaisesRegex(m.MissionError, "explicit network"):
+            self.create(network="none")
+
+    def test_codex_cli_report_uses_stdin_and_retains_completed_turn(self):
+        mission = self.create()
+        executor = m.Executor(self.store, mission)
+        observed = {}
+        def cli(command, label, **kwargs):
+            observed.update(command=command, env=kwargs["env"], prompt=Path(kwargs["input_path"]).read_text(), request=Path(kwargs["input_path"]))
+            log = executor.directory / "fixture-events.jsonl"
+            log.write_text(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "Friday. [S1:L1]"}}) + "\n" + json.dumps({"type": "turn.completed", "usage": {"output_tokens": 9}}) + "\n")
+            return 0, "", log
+        with patch.dict(os.environ, {"CODEX_API_KEY": "unit-only-placeholder"}), patch.object(codex_adapter, "resolve_executable", return_value="/usr/bin/true"), patch.object(sf_providers, "declared_executables", return_value={"/usr/bin/true"}), patch.object(executor, "run_process", cli):
+            self.assertEqual(executor.agent_turn("Selected source context", read_only=True), "Friday. [S1:L1]")
+        self.assertEqual(observed["command"][-1], "-")
+        self.assertEqual(observed["command"][observed["command"].index("--sandbox")+1], "read-only")
+        self.assertNotIn("Selected source context", observed["command"])
+        self.assertEqual(set(observed["env"]), {"CODEX_API_KEY"})
+        self.assertFalse(observed["request"].exists())
+        self.assertEqual(executor.inferences[0]["provider"], "codex")
+        self.assertEqual(executor.inferences[0]["usage"], {"output_tokens": 9})
+
+    def test_codex_incomplete_turn_and_missing_key_refuse_success(self):
+        executor = m.Executor(self.store, self.create())
+        with patch.dict(os.environ, {"CODEX_API_KEY": "", "OPENAI_API_KEY": ""}), patch.object(codex_adapter, "resolve_executable", return_value="/usr/bin/true"), patch.object(sf_providers, "declared_executables", return_value={"/usr/bin/true"}), patch.object(executor, "run_process", side_effect=AssertionError("No call without API key")):
+            with self.assertRaisesRegex(m.MissionError, "not configured"):
+                executor.agent_turn("task")
+        log = executor.directory / "failed.jsonl"
+        log.write_text(json.dumps({"type": "turn.failed", "error": {"message": "fixture"}}))
+        with patch.dict(os.environ, {"CODEX_API_KEY": "unit-only-placeholder"}), patch.object(codex_adapter, "resolve_executable", return_value="/usr/bin/true"), patch.object(sf_providers, "declared_executables", return_value={"/usr/bin/true"}), patch.object(executor, "run_process", return_value=(0,"",log)):
+            with self.assertRaisesRegex(m.MissionError, "complete successful turn"):
+                executor.agent_turn("task")
+
+    def test_legacy_provider_is_not_silently_sent_to_cloud(self):
+        item = self.approved()
+        config = dict(item["config"], runtime="local", network="none")
+        with self.store.db() as db:
+            db.execute("UPDATE missions SET config=? WHERE id=?", (json.dumps(config), item["id"]))
+        with patch.object(m.Executor, "agent_turn", side_effect=AssertionError("No provider migration")), patch.object(m, "checkpoint_call", side_effect=AssertionError("No workspace mutation")):
+            result = m.run_mission(self.store, item["id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertIn("retired provider", result["error"])
+        self.assertIsNone(result["checkpoint"])
+
+    def test_capabilities_report_local_ai_from_the_registry_not_from_a_literal(self):
+        """This asserted "deferred" and was right to: nothing on-device shipped.
+
+        An on-device provider ships now, so "deferred" would be a false answer
+        to the only question this key asks -- can this installation run a model
+        without leaving the machine. Its bridge is not packaged, so "available"
+        would be false too, and the honest third answer is the one that says
+        both: registered, and not runnable here.
+        """
+        caps = m.capabilities()
+        self.assertEqual(set(caps["runtimes"]),
+                         {"offline", "codex", "claude", "localmodel"})
+        self.assertEqual(caps["runtimes"]["codex"]["kinds"], ["code", "report"])
+        self.assertEqual(caps["runtimes"]["offline"]["kinds"], ["media"])
+        self.assertNotIn("authenticated", caps["runtimes"]["codex"])
+        # An on-device provider is registered, so whatever else is true,
+        # "deferred" is not. Which of the other two depends on whether a model
+        # service is answering on THIS machine, which is not this test's
+        # business -- the three states are decided below, on inputs.
+        self.assertEqual(m.on_device_providers(caps["providers"]), ["localmodel"])
+        self.assertNotEqual(caps["local_ai"], "deferred")
+        self.assertEqual(caps["local_ai"], m.local_ai_state(caps["providers"]))
+
+    def test_the_three_local_ai_states_are_each_decided_by_the_registry(self):
+        """Each state, on inputs, so none of them is reachable only in theory."""
+        def described(**overrides):
+            base = {"offline-media": {"network_policy": "none",
+                                      "capabilities": ["media_export"],
+                                      "available": True},
+                    "codex": {"network_policy": "allowlist",
+                              "capabilities": ["code_change"],
+                              "available": True}}
+            base.update(overrides)
+            return base
+
+        # Offline media export has no network either, and is not a model.
+        self.assertEqual(m.local_ai_state(described()), "deferred")
+        self.assertEqual(
+            m.local_ai_state(described(local={"network_policy": "none",
+                                              "capabilities": ["sourced_report"],
+                                              "available": False})),
+            "installed-unavailable")
+        self.assertEqual(
+            m.local_ai_state(described(local={"network_policy": "none",
+                                              "capabilities": ["sourced_report"],
+                                              "available": True})),
+            "available")
+
+    def test_every_provider_s_credential_file_is_read_not_just_one(self):
+        """The worker unit named codex.env and nothing else.
+
+        A second provider could ship its manifest, its adapter and its tests,
+        tell the operator to save a key at
+        ~/.config/shadowfetch/missions/<id>.env, and that file reached nothing:
+        its readiness then reported 'authenticated' about a value no mission
+        would ever be given. The directory is read now, and only for the
+        identities the registry declares.
+        """
+        home = self.base / "home"
+        directory = home / m.CREDENTIAL_DIR
+        directory.mkdir(parents=True)
+        for name, line in (("codex.env", "CODEX_API_KEY=codex-value"),
+                           ("claude.env", "ANTHROPIC_API_KEY=claude-value"),
+                           ("stray.env", "PATH=/attacker/bin\nLD_PRELOAD=/evil.so"),
+                           ("already.env", "CODEX_API_KEY=should-not-win")):
+            path = directory / name
+            path.write_text(line + "\n")
+            path.chmod(0o600)
+        world = directory / "leaky.env"
+        world.write_text("ANTHROPIC_API_KEY=world-readable\n")
+        world.chmod(0o644)
+
+        environ = {"CODEX_API_KEY": "already-exported"}
+        taken = m.load_provider_credentials(home=home, environ=environ)
+
+        # A second provider's identity now arrives.
+        self.assertEqual(environ["ANTHROPIC_API_KEY"], "claude-value")
+        self.assertIn("ANTHROPIC_API_KEY", taken)
+        # An identity no provider declares is not put into the environment,
+        # so a file dropped in this directory cannot decide what runs.
+        self.assertNotIn("PATH", environ)
+        self.assertNotIn("LD_PRELOAD", environ)
+        # A value exported deliberately is not replaced by a file.
+        self.assertEqual(environ["CODEX_API_KEY"], "already-exported")
+
+        # And a credential file anyone can read is refused rather than used.
+        fresh = {}
+        m.load_provider_credentials(home=home, environ=fresh)
+        self.assertEqual(fresh.get("ANTHROPIC_API_KEY"), "claude-value",
+                         "the 0600 file should still be read")
+        self.assertNotEqual(fresh.get("ANTHROPIC_API_KEY"), "world-readable")
+
+    def test_the_worker_unit_names_no_provider(self):
+        """A provider name in a unit file is still a provider name in code."""
+        unit = (Path(m.__file__).resolve().parents[2]
+                / "systemd/user/shadowfetch-missions.service")
+        if not unit.is_file():
+            self.skipTest("running from a tree without the packaged unit")
+        directives = [line for line in unit.read_text().splitlines()
+                      if line.strip() and not line.strip().startswith("#")]
+        self.assertFalse([d for d in directives if "EnvironmentFile" in d],
+                         "the unit reads one provider's credential file by name")
+
+    def test_the_receipt_note_names_the_list_it_explains_and_nothing_else(self):
+        """This is the worst direction a stale string can point.
+
+        The note was a literal: "egress_allowlist and masked_paths are not
+        filtered or masked by Firebreak; no syscall profile is applied." Both of
+        the first two became enforced -- by nftables in the sandbox's own
+        network namespace and by mounts in its own mount namespace -- and the
+        sentence did not change, so the artifact a person reads before ACCEPTING
+        an agent's work told them to discount protection they had. It also named
+        two fields that were not in `declared_but_not_enforced` at all, which is
+        a note explaining a list it had stopped describing.
+        """
+        note = m.enforcement_note(["syscall_profile"])
+        self.assertIn("syscall_profile", note)
+        for gone in ("egress_allowlist", "masked_paths"):
+            self.assertNotIn(gone, note,
+                             "the note names a field that is not in the list")
+
+        # Every field in the list is named, and no field outside it is.
+        both = m.enforcement_note(["alpha_field", "beta_field"])
+        self.assertIn("alpha_field", both)
+        self.assertIn("beta_field", both)
+        self.assertNotIn("syscall_profile", both)
+
+        # An empty list must not read as a clean bill of health for the sandbox.
+        empty = m.enforcement_note([])
+        self.assertIn("declared", empty)
+        self.assertIn("not a claim", empty,
+                      "an empty gap list reads as 'nothing to worry about'")
+
+    def test_the_receipt_note_is_built_from_the_receipt_s_own_list(self):
+        """Not merely consistent today: derived, so it cannot drift again."""
+        mission = self.approved()
+        unenforced = m.unenforced_fields()
+        note = m.enforcement_note(unenforced)
+        for field in unenforced:
+            self.assertIn(field, note)
+        self.assertEqual(note, m.enforcement_note(list(unenforced)))
+        self.assertIsNotNone(mission)
+
+    def test_a_workspace_root_owned_by_someone_else_is_refused_at_the_boundary(self):
+        """Found on a QA base image: `~/Workspaces` owned by root, so the
+        desktop user could not create the checkpoint store and the first call
+        to touch it died with a raw
+        `PermissionError: '/home/<user>/Workspaces/.sf-checkpoints'` -- from
+        whichever call happened to be first, saying nothing about the cause.
+
+        Nothing in the packages creates that directory as root; the shipped
+        tool makes it as the invoking user. But an image, a restore or a stray
+        sudo can, and then every mission on that machine fails somewhere far
+        from the reason. This says the reason once, at the boundary, and does
+        not attempt a repair -- changing the ownership of a directory the
+        caller does not own is a privileged operation, and this codebase makes
+        those explicit rather than convenient.
+        """
+        foreign = self.base / "not-mine"
+        foreign.mkdir()
+        with patch.dict(os.environ, {"SHADOWFETCH_AGENT_WORKSPACES": str(foreign)}), \
+                patch.object(m.os, "getuid", lambda: os.stat(foreign).st_uid + 1):
+            with self.assertRaises(m.MissionError) as caught:
+                m.workspace_root()
+        message = str(caught.exception)
+        self.assertIn(str(foreign), message)
+        self.assertIn("belongs to uid", message)
+        self.assertIn("SHADOWFETCH_AGENT_WORKSPACES", message,
+                      "the refusal does not say what to do about it")
+
+    def test_a_root_that_does_not_exist_yet_is_not_a_refusal(self):
+        """It is created on first use; refusing here would break a fresh
+        install, which is the ordinary case."""
+        fresh = self.base / "not-created-yet"
+        with patch.dict(os.environ, {"SHADOWFETCH_AGENT_WORKSPACES": str(fresh)}):
+            self.assertEqual(m.workspace_root(), fresh.resolve())
+
+    def test_secrets_are_redacted(self):
+        with patch.dict(os.environ, {"CODEX_API_KEY": "private-test-credential"}):
+            self.assertNotIn("private-test-credential", m.clean("key private-test-credential"))
+
+    # W-15: a page limit must be an explicit, reportable boundary, never a silent cut.
+    def bulk_missions(self, count, *, state="queued", year=2000):
+        config = json.dumps({"runtime": "codex", "model": "", "inputs": ["facts.md"], "test": None, "network": "allow", "timeout": 900})
+        rows = [(f"mission-{year}{index:06d}", f"Bulk {index}", "report", state, str(self.ws), "prompt", config,
+                 f"{year}-01-01T{index // 3600 % 24:02d}:{index // 60 % 60:02d}:{index % 60:02d}+00:00", m.now()) for index in range(count)]
+        with self.store.db() as db:
+            db.executemany("INSERT INTO missions(id,title,kind,state,workspace,prompt,config,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", rows)
+        return rows
+
+    def test_records_past_the_page_limit_are_reported_not_dropped(self):
+        self.bulk_missions(m.LIST_PAGE_LIMIT + 1)
+        with self.store.db() as db:
+            legacy = db.execute("SELECT * FROM missions ORDER BY created_at DESC,rowid DESC LIMIT 1000").fetchall()
+        self.assertEqual(len(legacy), m.LIST_PAGE_LIMIT)
+        self.assertEqual(len(self.store.list()), m.LIST_PAGE_LIMIT + 1)
+        page = self.store.page()
+        self.assertEqual(len(page["missions"]), m.LIST_PAGE_LIMIT)
+        self.assertEqual((page["total"], page["truncated"], page["next_offset"]), (m.LIST_PAGE_LIMIT + 1, True, m.LIST_PAGE_LIMIT))
+        rest = self.store.page(offset=page["next_offset"])
+        self.assertEqual((len(rest["missions"]), rest["truncated"], rest["next_offset"]), (1, False, None))
+        self.assertEqual([item["id"] for item in self.store.list()], [item["id"] for item in page["missions"] + rest["missions"]])
+        self.assertEqual(self.store.page(states=("queued",))["total"], m.LIST_PAGE_LIMIT + 1)
+        self.assertEqual(self.store.page(states=())["missions"], [])
+        for invalid in ({"limit": 0}, {"limit": -5}, {"offset": -1}):
+            with self.subTest(invalid=invalid), self.assertRaises(m.MissionError):
+                self.store.page(**invalid)
+
+    def test_pending_review_beyond_one_page_still_blocks_new_work(self):
+        first = self.approved()
+        with patch.object(m.Executor, "agent_turn", return_value="Friday. [S1:L1]"):
+            self.assertEqual(m.run_mission(self.store, first["id"])["state"], "waiting-review")
+        self.bulk_missions(m.LIST_PAGE_LIMIT, year=2099)
+        second = self.approved()
+        with patch.object(m.Executor, "agent_turn", side_effect=AssertionError("must not run beside an unreviewed result")):
+            with self.assertRaisesRegex(m.MissionError, "Review the previous"):
+                m.run_mission(self.store, second["id"])
+        self.assertEqual(self.store.get(second["id"])["state"], "queued")
+
+    def test_undo_finds_its_place_in_a_queue_larger_than_one_page(self):
+        mission = self.approved()
+        with patch.object(m.Executor, "agent_turn", return_value="Friday. [S1:L1]"):
+            m.run_mission(self.store, mission["id"])
+        self.bulk_missions(m.LIST_PAGE_LIMIT, year=2099)
+        self.assertEqual(m.review(self.store, mission["id"], "undo")["state"], "undone")
+        self.assertFalse((self.ws / "mission-output").exists())
+
+    def test_undo_reports_a_missing_queue_row_instead_of_crashing(self):
+        mission = self.approved()
+        with patch.object(m.Executor, "agent_turn", return_value="Friday. [S1:L1]"):
+            m.run_mission(self.store, mission["id"])
+        with patch.object(m.Store, "list", return_value=[]):
+            with self.assertRaisesRegex(m.MissionError, "no longer listed"):
+                m.review(self.store, mission["id"], "undo")
+        self.assertEqual(self.store.get(mission["id"])["state"], "waiting-review")
+
+    def test_cli_reports_an_exhausted_iterator_as_json_not_a_traceback(self):
+        mission = self.create()
+        printed = []
+        with patch.object(m.Store, "get", side_effect=StopIteration()), patch("builtins.print", lambda *values, **kwargs: printed.append(" ".join(map(str, values)))):
+            code = m.main(["--json", "show", mission["id"]])
+        self.assertEqual(code, 1)
+        self.assertIn("Mission records were incomplete", json.loads(printed[-1])["error"])
+
+    # W-16: the guard covers new validation files, measured against a pristine baseline.
+    def test_code_refuses_newly_added_validation_files(self):
+        (self.ws / "app.py").write_text("def add(a, b): return a - b\n")
+        mission = self.approved(kind="code", inputs=["app.py"], test=[sys.executable, "-c", "import app"])
+        def sneak(executor, prompt):
+            (executor.ws / "app.py").write_text("def add(a, b): return a + b\n")
+            (executor.ws / "conftest.py").write_text("collect_ignore_glob = ['*']\n")
+            (executor.ws / "test_added.py").write_text("def test_ok():\n    assert True\n")
+        with patch.object(m.Executor, "agent_turn", sneak), patch.object(m.Executor, "run_process", side_effect=AssertionError("validation must not run")):
+            result = m.run_mission(self.store, mission["id"])
+        self.assertEqual(result["state"], "failed")
+        self.assertIn("added unreviewed test/validation files", result["error"])
+        self.assertIn("conftest.py", result["error"])
+        self.assertIn("test_added.py", result["error"])
+
+    def test_validation_guard_baseline_stays_pristine_across_retries(self):
+        (self.ws / "app.py").write_text("value = 1\n")
+        (self.ws / "test_app.py").write_text("raise AssertionError('required behavior')\n")
+        mission = self.approved(kind="code", inputs=["app.py"], test=[sys.executable, "test_app.py"])
+        with patch.object(m.Executor, "agent_turn", lambda executor, prompt: (executor.ws / "test_app.py").write_text("pass\n")):
+            first = m.run_mission(self.store, mission["id"])
+        self.assertEqual(first["state"], "failed")
+        self.assertIn("changed or removed a pre-existing test", first["error"])
+        self.assertEqual((self.ws / "test_app.py").read_text(), "pass\n")
+        self.store.retry(mission["id"])
+        with patch.object(m.Executor, "agent_turn", lambda executor, prompt: None), patch.object(m.Executor, "run_process", side_effect=AssertionError("validation must not run")):
+            second = m.run_mission(self.store, mission["id"])
+        self.assertEqual(second["state"], "failed")
+        self.assertIn("changed or removed a pre-existing test", second["error"])
+
+    def test_legitimate_code_mission_still_passes_the_guard(self):
+        (self.ws / "app.py").write_text("def add(a, b): return a - b\n")
+        (self.ws / "tests").mkdir()
+        (self.ws / "tests" / "test_add.py").write_text("import app\nassert app.add(2, 3) == 5\n")
+        mission = self.approved(kind="code", inputs=["app.py"], test=[sys.executable, "tests/test_add.py"])
+        original = m.Executor.run_process
+        with patch.object(m.Executor, "agent_turn", lambda executor, prompt: (executor.ws / "app.py").write_text("def add(a, b): return a + b\n")), \
+             patch.object(m.Executor, "run_process", lambda executor, command, label, **kwargs: original(executor, command, label, sandbox=False, env={"PYTHONPATH": str(executor.ws)})):
+            result = m.run_mission(self.store, mission["id"])
+        self.assertEqual(result["state"], "waiting-review", result["error"])
+
+    # W-17: structured change rows, escaped paths and an explicit truncation trailer.
+    def test_change_rows_are_typed_and_paths_cannot_forge_diff_structure(self):
+        forged = "evil\n+++ after/etc/shadow\n"
+        before = {"kept.txt": {"sha256": "a" * 64, "bytes": 4, "text": "one\n"}}
+        after = {"kept.txt": {"sha256": "b" * 64, "bytes": 4, "text": "two\n"}, forged: {"sha256": "c" * 64, "bytes": 1}}
+        change = m.git_change(before, after)
+        rows = {row["path"]: row for row in change.rows}
+        self.assertEqual(set(rows), {"kept.txt", json.dumps(forged)})
+        self.assertEqual((rows["kept.txt"]["change"], rows["kept.txt"]["kind"]), ("modified", "text"))
+        self.assertEqual((rows[json.dumps(forged)]["change"], rows[json.dumps(forged)]["kind"]), ("added", "binary"))
+        self.assertEqual(rows["kept.txt"]["before"], {"sha256": "a" * 64, "bytes": 4})
+        rendered = m.difference(before, after)
+        self.assertNotIn("\n+++ after/etc/shadow", rendered)
+        self.assertEqual(sum(1 for line in rendered.splitlines() if line.startswith("+++ ")), 1)
+        self.assertEqual(sum(1 for line in rendered.splitlines() if line.startswith("--- ")), 1)
+        self.assertEqual(sum(1 for line in rendered.splitlines() if line.startswith("+ ")), 1)
+        self.assertFalse(change.truncated)
+        self.assertEqual(change.counts(), {"added": 1, "removed": 0, "modified": 1})
+
+    def test_change_summary_ends_with_an_explicit_truncation_trailer(self):
+        block = "".join(f"line {number:04d}\n" for number in range(200))
+        after = {f"file-{index:04d}.txt": {"sha256": str(index).zfill(64), "bytes": len(block), "text": block} for index in range(1000)}
+        change = m.git_change({}, after)
+        self.assertTrue(change.truncated)
+        self.assertGreater(change.omitted_rows, 0)
+        self.assertEqual(len(change.rows), 1000)
+        rendered = m.difference({}, after)
+        self.assertTrue(rendered.endswith("The complete typed record is in changes.json.\n"), rendered[-200:])
+        self.assertIn(f"{change.omitted_rows} of 1000 change rows omitted", rendered)
+        body = rendered[:rendered.index("... change summary truncated")]
+        self.assertTrue(body.endswith("\n"))
+        self.assertLessEqual(len(body.encode()), m.MAX_OUTPUT)
+
+    def test_receipt_records_a_structured_change_summary(self):
+        mission = self.approved()
+        with patch.object(m.Executor, "agent_turn", return_value="Friday. [S1:L1]"):
+            result = m.run_mission(self.store, mission["id"])
+        receipt = json.loads(Path(result["receipt"]).read_text())
+        self.assertFalse(receipt["diff_truncated"])
+        record = json.loads(Path(receipt["changes"]).read_text())
+        self.assertEqual(record["schema"], 1)
+        self.assertEqual(record["counts"], {"added": 2, "removed": 0, "modified": 0})
+        self.assertTrue(any(row["path"].endswith("report.md") and row["change"] == "added" for row in record["rows"]))
+        self.assertTrue(all(row["after"]["sha256"] for row in record["rows"]))
+
+class ReadLockRetryTests(unittest.TestCase):
+    """Store._read waits out a transient WAL lock on read-only queries.
+
+    db()'s PRAGMA busy_timeout=30000 handles the common case, but its C busy
+    handler is a sleep loop that can be starved when every core is pegged, so a
+    read very occasionally surfaced "database is locked". _read retries such a
+    read a bounded number of times; a non-lock error, and a lock that never
+    clears, still propagate. The worker's write path does NOT go through _read.
+    """
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp.name).resolve()
+        self.ws = self.base / "Workspaces" / "example"
+        self.ws.mkdir(parents=True)
+        (self.ws / "facts.md").write_text("The launch is Friday.\n")
+        self.env = patch.dict(os.environ, {"SHADOWFETCH_AGENT_WORKSPACES": str(self.ws.parent), "SHADOWFETCH_MISSIONS_STATE": str(self.base / "state")})
+        self.env.start()
+        self.store = m.Store()
+        # Real sleeps would make the give-up test wait out the backoff for no
+        # reason; the timing is not what is under test here.
+        self.no_sleep = patch.object(m.time, "sleep", lambda _s: None)
+        self.no_sleep.start()
+    def tearDown(self):
+        self.no_sleep.stop()
+        self.env.stop()
+        self.temp.cleanup()
+
+    def test_transient_lock_is_retried_then_succeeds(self):
+        calls = {"n": 0}
+        def op():
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise m.sqlite3.OperationalError("database is locked")
+            return "value"
+        self.assertEqual(self.store._read(op), "value")
+        self.assertEqual(calls["n"], 3)
+
+    def test_non_lock_error_propagates_immediately(self):
+        calls = {"n": 0}
+        def op():
+            calls["n"] += 1
+            raise m.sqlite3.OperationalError("no such table: missions")
+        with self.assertRaises(m.sqlite3.OperationalError):
+            self.store._read(op)
+        self.assertEqual(calls["n"], 1)
+
+    def test_persistent_lock_gives_up_after_the_bound(self):
+        calls = {"n": 0}
+        def op():
+            calls["n"] += 1
+            raise m.sqlite3.OperationalError("database is locked")
+        # Surfaced as DatabaseBusy -- a MissionError the CLI reports as JSON
+        # with "busy": true -- with the SQLite error kept as its cause.
+        with self.assertRaises(m.DatabaseBusy) as caught:
+            self.store._read(op)
+        self.assertIsInstance(caught.exception.__cause__, m.sqlite3.OperationalError)
+        self.assertEqual(calls["n"], m.READ_LOCK_RETRIES)
+
+    def test_get_returns_after_transient_open_lock(self):
+        mission = self.store.create(kind="report", provider_id="codex", workspace_value="example", title="t", prompt="p", inputs=["facts.md"], network="allow")
+        real_connect = m.sqlite3.connect
+        state = {"left": 2}
+        def flaky_connect(*a, **k):
+            if state["left"] > 0:
+                state["left"] -= 1
+                raise m.sqlite3.OperationalError("database is locked")
+            return real_connect(*a, **k)
+        with patch.object(m.sqlite3, "connect", flaky_connect):
+            got = self.store.get(mission["id"])
+        self.assertEqual(got["id"], mission["id"])
+        self.assertEqual(state["left"], 0)
+
+
+class WriteLockRetryTests(unittest.TestCase):
+    """The write path under a held database lock (5.0.0 QA stress).
+
+    Under heavy host load `shadowfetch-missions create` failed with "database
+    is locked" after 32-60s and `list` ran past the QA probe's 15s. create is
+    now one retried IMMEDIATE transaction with no side effect outside it; the
+    open no longer queues for the write lock; and a short CLI command answers
+    "busy" inside CLI_LOCK_BUDGET_SECONDS instead of hanging.
+    """
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp.name).resolve()
+        self.ws = self.base / "Workspaces" / "example"
+        self.ws.mkdir(parents=True)
+        (self.ws / "facts.md").write_text("The launch is Friday.\n")
+        self.state = self.base / "state"
+        self.env = patch.dict(os.environ, {"SHADOWFETCH_AGENT_WORKSPACES": str(self.ws.parent), "SHADOWFETCH_MISSIONS_STATE": str(self.state)})
+        self.env.start()
+        self.store = m.Store()
+        self.holders = []
+    def tearDown(self):
+        for holder in self.holders:
+            try:
+                holder.rollback()
+                holder.close()
+            except Exception:
+                pass
+        self.env.stop()
+        self.temp.cleanup()
+
+    def hold_write_lock(self, release_after=None):
+        """Another process's writer: a connection holding BEGIN IMMEDIATE."""
+        holder = m.sqlite3.connect(self.store.db_path, isolation_level=None,
+                                   check_same_thread=False)
+        holder.execute("BEGIN IMMEDIATE")
+        self.holders.append(holder)
+        if release_after is not None:
+            timer = threading.Timer(release_after, holder.rollback)
+            timer.start()
+            self.addCleanup(timer.cancel)
+        return holder
+
+    def create(self, title="Launch report"):
+        return self.store.create(kind="report", provider_id="codex", workspace_value="example", title=title, prompt="p", inputs=["facts.md"], network="allow")
+
+    def count(self, sql, *args):
+        with self.store.db() as db:
+            return db.execute(sql, args).fetchone()[0]
+
+    def test_create_takes_the_write_lock_up_front(self):
+        statements = []
+        real_db = self.store.db
+        @contextlib.contextmanager
+        def traced():
+            with real_db() as db:
+                db.set_trace_callback(statements.append)
+                yield db
+        with patch.object(self.store, "db", traced):
+            self.create()
+        writes = [s for s in statements if s.startswith(("BEGIN", "INSERT"))]
+        self.assertEqual(writes[0], "BEGIN IMMEDIATE", writes)
+
+    def test_create_succeeds_once_a_concurrent_writer_releases(self):
+        self.store.lock_wait = 0.2
+        self.hold_write_lock(release_after=0.6)
+        started = time.monotonic()
+        mission = self.create()
+        self.assertGreaterEqual(time.monotonic() - started, 0.4, "the held lock was not contended")
+        self.assertEqual(mission["state"], "queued")
+        self.assertEqual(self.count("SELECT COUNT(*) FROM missions"), 1)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM events WHERE mission=?", mission["id"]), 1)
+        self.assertTrue(self.store.verify_chain()["ok"])
+
+    def test_create_gives_up_cleanly_after_the_bound(self):
+        self.store.lock_wait = 0.05
+        events_before = self.count("SELECT COUNT(*) FROM events")
+        holder = self.hold_write_lock()
+        opened = {"n": 0}
+        real_db = self.store.db
+        @contextlib.contextmanager
+        def counted():
+            opened["n"] += 1
+            with real_db() as db:
+                yield db
+        with patch.object(m.time, "sleep", lambda _s: None), \
+                patch.object(self.store, "db", counted):
+            with self.assertRaises(m.DatabaseBusy) as caught:
+                self.create()
+        self.assertIn("NOT created", str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, m.sqlite3.OperationalError)
+        self.assertEqual(opened["n"], m.WRITE_LOCK_RETRIES)
+        holder.rollback()
+        self.assertEqual(self.count("SELECT COUNT(*) FROM missions"), 0)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM events"), events_before)
+
+    def test_a_retried_create_never_duplicates_the_mission(self):
+        # The lock error lands INSIDE the transaction, after the INSERT and
+        # before COMMIT -- the rollback case the retry relies on.
+        real_append = self.store._append
+        calls = {"n": 0}
+        def flaky_append(db, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise m.sqlite3.OperationalError("database is locked")
+            return real_append(db, **kwargs)
+        with patch.object(m.time, "sleep", lambda _s: None), \
+                patch.object(self.store, "_append", flaky_append):
+            mission = self.create()
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM missions"), 1)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM events WHERE mission=?", mission["id"]), 1)
+        self.assertTrue(self.store.verify_chain()["ok"])
+
+    def test_an_attempt_that_did_commit_is_recognised_not_repeated(self):
+        real_write = self.store._write
+        def commit_then_report_locked(unit, busy_message=m.DATABASE_BUSY_MESSAGE):
+            first = unit()
+            second = real_write(unit, busy_message)
+            self.assertEqual(first[0]["id"], second[0]["id"])
+            return second
+        with patch.object(self.store, "_write", commit_then_report_locked):
+            mission = self.create()
+        self.assertEqual(self.count("SELECT COUNT(*) FROM missions"), 1)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM events WHERE mission=?", mission["id"]), 1)
+
+    def test_non_lock_errors_propagate_immediately(self):
+        calls = {"n": 0}
+        def broken_append(db, **kwargs):
+            calls["n"] += 1
+            raise m.sqlite3.OperationalError("disk I/O error")
+        with patch.object(self.store, "_append", broken_append):
+            with self.assertRaises(m.sqlite3.OperationalError) as caught:
+                self.create()
+        self.assertNotIsInstance(caught.exception, m.DatabaseBusy)
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM missions"), 0)
+
+    def test_opening_a_current_store_does_not_queue_for_the_write_lock(self):
+        """Every CLI `list` used to take BEGIN IMMEDIATE in Store.__init__."""
+        self.create()
+        self.hold_write_lock()
+        started = time.monotonic()
+        store = m.Store(lock_budget=1)
+        listed = store.page()
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(listed["total"], 1)
+
+    def test_cli_create_says_busy_within_its_budget(self):
+        self.hold_write_lock()
+        printed = []
+        started = time.monotonic()
+        with patch.object(m, "CLI_LOCK_BUDGET_SECONDS", 0.5), \
+                patch("builtins.print", lambda *v, **k: printed.append(" ".join(map(str, v)))):
+            code = m.main(["--json", "create", "--kind", "report", "--provider", "codex",
+                           "--workspace", "example", "--title", "t", "--prompt", "p",
+                           "--input", "facts.md", "--network", "allow"])
+        elapsed = time.monotonic() - started
+        self.assertEqual(code, 1)
+        payload = json.loads(printed[-1])
+        self.assertTrue(payload["busy"])
+        self.assertIn("NOT created", payload["error"])
+        self.assertLess(elapsed, 5, "the CLI waited past its own budget")
+        self.assertEqual(self.count("SELECT COUNT(*) FROM missions"), 0)
+
+    def test_cli_names_a_bare_lock_error_as_busy(self):
+        printed = []
+        with patch.object(m.Store, "page", side_effect=m.sqlite3.OperationalError("database is locked")), \
+                patch("builtins.print", lambda *v, **k: printed.append(" ".join(map(str, v)))):
+            code = m.main(["--json", "list"])
+        self.assertEqual(code, 1)
+        payload = json.loads(printed[-1])
+        self.assertEqual(payload, {"error": m.DATABASE_BUSY_MESSAGE, "busy": True})
+
+    def test_short_commands_are_bounded_and_long_ones_are_not(self):
+        for name in ("list", "show", "create", "cancel", "events", "records"):
+            self.assertIn(name, m.CLI_BOUNDED_COMMANDS)
+        for name in ("run", "review", "worker", "watch", "audit"):
+            self.assertNotIn(name, m.CLI_BOUNDED_COMMANDS)
+        # Below the desktop client's 30s and the QA probe's 15s.
+        self.assertLess(m.CLI_LOCK_BUDGET_SECONDS, 15)
+
+    def test_racing_first_opens_through_the_cli_all_answer(self):
+        """The stress shape: the worker and a CLI call open a brand-new state
+        directory at the same moment. Separate PROCESSES, as in the VM."""
+        fresh = self.base / "fresh-state"
+        backend = SOURCE.parents[3] / "bin/shadowfetch-missions"
+        env = {**os.environ, "SHADOWFETCH_MISSIONS_STATE": str(fresh)}
+        procs = [subprocess.Popen([sys.executable, str(backend), "--json", "list"], env=env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                 for _ in range(6)]
+        results = [p.communicate(timeout=120) + (p.returncode,) for p in procs]
+        for out, err, code in results:
+            self.assertEqual(code, 0, out + err)
+            self.assertEqual(json.loads(out), [])
+        store = m.Store(fresh)
+        with store.db() as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], m.SCHEMA_VERSION)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM events WHERE event=?", (m.CHAIN_GENESIS,)).fetchone()[0], 1)
+            self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+
+    def test_an_unconverted_file_is_never_taken_for_a_current_store(self):
+        fresh = self.base / "zero"
+        fresh.mkdir()
+        (fresh / "missions.sqlite3").write_bytes(b"")
+        store = m.Store.__new__(m.Store)
+        store.db_path = fresh / "missions.sqlite3"
+        store.lock_wait, store._lock_deadline = 1, None
+        self.assertFalse(store._schema_current())
+        self.assertTrue(self.store._schema_current())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -1,0 +1,609 @@
+#!/usr/bin/env python3
+"""Record and verify a Shadowfetch Linux release's acceptance evidence.
+
+ONE implementation for every release. The release identity a manifest must
+declare, and the manifest's default location, are DATA in
+tools/release/versions/<version>.toml.
+
+This family was the clearest case for Stage Q: verify_acceptance_4_0_0.py
+differed from the 2.1.4 copy in three hunks -- the version string, the edition
+string and the default manifest path -- yet the waiver contract and the
+evidence-quality floors were added to the 4.0.0 copy only, so the five older
+copies still accept a 0-byte "pass".
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import struct
+import sys
+import tempfile
+from typing import Any
+
+import gate
+
+
+VALID_STATUSES = {"pending", "pass", "fail", "blocked", "waived"}
+VALID_PHASES = {"prepublish", "postpublish"}
+VALID_KINDS = {"artifact", "json", "log", "report", "screenshot"}
+# A required case may only be "pass" or "waived" for a release to proceed. "waived"
+# is a recorded, written decision to accept the gap; "pending" is nobody having run it.
+WAIVER_FIELDS = ("approver", "reason")
+
+# Evidence-quality floors. These reject files that cannot be a real result:
+# empty files, files far too small to hold one, and files whose bytes carry almost
+# no information (all-zero logs, blank/solid-colour screenshots).
+MIN_EVIDENCE_BYTES = 8
+MIN_SCREENSHOT_BYTES = 1024
+MIN_EVIDENCE_ENTROPY_BITS = 1.5
+
+# The packages under test, for a release that ships no image (an APT-only point
+# update). artifact.iso_sha256 then names the BASE image the update is applied
+# to -- which every receipt of that base release is bound to as well -- so the
+# image digest alone cannot tell this update's evidence from the previous
+# release's. These two digests of the signed indices pin every .deb and source
+# file; `record` stamps them onto each entry it writes (and onto a waiver), the
+# same way it stamps artifact_sha256, and the APT-only publisher refuses an
+# entry that does not carry the digests of the indices it is publishing. An ISO
+# release's manifest does not set them, and `verify` does not read them.
+PACKAGE_INDEX_FIELDS = ("apt_packages_sha256", "apt_sources_sha256")
+
+
+def package_index_stamp(data: dict[str, Any]) -> dict[str, str]:
+    """The manifest's package-index digests, for stamping onto a record."""
+    artifact = data.get("artifact") or {}
+    stamp: dict[str, str] = {}
+    for field in PACKAGE_INDEX_FIELDS:
+        value = artifact.get(field) if isinstance(artifact, dict) else None
+        if isinstance(value, str) and len(value) == 64 \
+                and all(char in "0123456789abcdefABCDEF" for char in value):
+            stamp[field] = value.lower()
+    return stamp
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_manifest(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError("manifest root must be an object")
+    return data
+
+
+def save_manifest(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, sort_keys=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def png_size(path: Path) -> tuple[int, int]:
+    with path.open("rb") as handle:
+        header = handle.read(24)
+    if len(header) != 24 or header[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("not a PNG file")
+    if header[12:16] != b"IHDR":
+        raise ValueError("PNG does not begin with IHDR")
+    return struct.unpack(">II", header[16:24])
+
+
+def byte_entropy(path: Path) -> float:
+    """Shannon entropy of the file's bytes, in bits per byte (0.0 to 8.0)."""
+    counts: collections.Counter[int] = collections.Counter()
+    total = 0
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            counts.update(chunk)
+            total += len(chunk)
+    if not total:
+        return 0.0
+    entropy = -sum(
+        (count / total) * math.log2(count / total) for count in counts.values()
+    )
+    return max(0.0, entropy)
+
+
+def evidence_quality_errors(path: Path, kind: str) -> list[str]:
+    """Reject evidence that is empty, implausibly small, or informationless."""
+    errors: list[str] = []
+    size = path.stat().st_size
+    if size == 0:
+        return ["evidence file is empty (0 bytes)"]
+    minimum = MIN_SCREENSHOT_BYTES if kind == "screenshot" else MIN_EVIDENCE_BYTES
+    if size < minimum:
+        errors.append(
+            f"evidence file is {size} bytes, below the {minimum}-byte minimum for "
+            f"kind {kind!r}"
+        )
+    entropy = byte_entropy(path)
+    if entropy < MIN_EVIDENCE_ENTROPY_BITS:
+        errors.append(
+            f"evidence file carries {entropy:.2f} bits/byte of entropy, below the "
+            f"{MIN_EVIDENCE_ENTROPY_BITS:.2f} floor: it is blank, uniform or "
+            "otherwise not a real result"
+        )
+    return errors
+
+
+def artifact_errors(data: dict[str, Any], manifest: Path) -> list[str]:
+    """Re-hash the ISO this manifest claims to be about.
+
+    THE GATE NEVER OPENED IT. `verify` checked that `artifact.iso_sha256` was a
+    non-empty string and stopped, so a manifest could name the digest of an
+    image that did not exist, or of a different image entirely, and
+    `make acceptance-gate` would print ACCEPTANCE_PASSED. Two tools downstream
+    -- evidence.py and package_release_evidence -- already re-hash the real
+    file and refuse on mismatch, so the check existed twice and zero times in
+    the gate the release criteria actually point at.
+
+    Absence is an error, not a skip. A manifest that describes an artifact
+    nobody can produce is not "not yet verifiable"; it is describing nothing.
+    """
+    artifact = data.get("artifact")
+    if not isinstance(artifact, dict):
+        return ["artifact must be an object"]
+    declared = artifact.get("iso_sha256")
+    path_value = artifact.get("iso_path")
+    if not isinstance(path_value, str) or not path_value:
+        return ["artifact.iso_path is not recorded, so nothing can be verified"]
+    if not isinstance(declared, str) or len(declared) != 64:
+        return ["artifact.iso_sha256 must contain 64 hexadecimal characters"]
+    iso = Path(path_value)
+    if not iso.is_absolute():
+        iso = manifest.parents[2] / path_value
+    if not iso.is_file():
+        return [f"artifact.iso_path names no file: {iso}"]
+    errors: list[str] = []
+    actual = sha256_file(iso)
+    if actual != declared.lower():
+        errors.append(
+            f"artifact.iso_sha256 does not describe {iso}: manifest says "
+            f"{declared}, the file is {actual}")
+    size = artifact.get("iso_size_bytes")
+    on_disk = iso.stat().st_size
+    if isinstance(size, int) and size != on_disk:
+        errors.append(
+            f"artifact.iso_size_bytes says {size}, {iso} is {on_disk} bytes")
+    return errors
+
+
+def waiver_errors(case: dict[str, Any]) -> list[str]:
+    """A waived case must carry a written, attributed reason."""
+    waiver = case.get("waiver")
+    if not isinstance(waiver, dict):
+        return ["waived status requires a waiver object with approver and reason"]
+    errors: list[str] = []
+    for field in WAIVER_FIELDS:
+        value = waiver.get(field)
+        if not isinstance(value, str) or not value.strip():
+            errors.append(f"waiver.{field} must be a non-empty string")
+    return errors
+
+
+def repo_root_for(manifest: Path) -> Path:
+    candidate = manifest.resolve()
+    for parent in (candidate.parent, *candidate.parents):
+        if (parent / "Makefile").is_file() and (parent / "packages").is_dir():
+            return parent
+    raise ValueError(f"could not locate repository root above {manifest}")
+
+
+def evidence_root_for(manifest: Path, data: dict[str, Any]) -> Path:
+    root = Path(str(data.get("evidence_root", "")))
+    if not root.is_absolute():
+        root = repo_root_for(manifest) / root
+    return root.resolve()
+
+
+def resolve_evidence(root: Path, value: str) -> Path:
+    candidate = (root / value).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"evidence path escapes evidence root: {value}") from exc
+    return candidate
+
+
+def expected_release(release_data: gate.ReleaseData) -> dict[str, str]:
+    """Identity the acceptance manifest must declare, from the version data."""
+    return {
+        "version": release_data.version,
+        "edition": release_data.edition,
+        "codename": release_data.display_codename,
+    }
+
+
+def validate_manifest(
+    data: dict[str, Any], release_data: gate.ReleaseData
+) -> list[str]:
+    errors: list[str] = []
+    if data.get("schema_version") != 1:
+        errors.append("schema_version must be 1")
+    release = data.get("release")
+    if not isinstance(release, dict):
+        errors.append("release must be an object")
+    else:
+        expected = expected_release(release_data)
+        for key, value in expected.items():
+            if release.get(key) != value:
+                errors.append(f"release.{key} must be {value!r}")
+
+    cases = data.get("cases")
+    if not isinstance(cases, list) or not cases:
+        errors.append("cases must be a non-empty array")
+        return errors
+
+    seen: set[str] = set()
+    for index, case in enumerate(cases):
+        label = f"cases[{index}]"
+        if not isinstance(case, dict):
+            errors.append(f"{label} must be an object")
+            continue
+        case_id = case.get("id")
+        if not isinstance(case_id, str) or not case_id:
+            errors.append(f"{label}.id must be a non-empty string")
+        elif case_id in seen:
+            errors.append(f"duplicate case id: {case_id}")
+        else:
+            seen.add(case_id)
+        if case.get("phase") not in VALID_PHASES:
+            errors.append(f"{case_id or label}: invalid phase")
+        if case.get("status") not in VALID_STATUSES:
+            errors.append(f"{case_id or label}: invalid status")
+        elif case.get("status") == "waived":
+            errors.extend(
+                f"{case_id or label}: {error}" for error in waiver_errors(case)
+            )
+        if not isinstance(case.get("required"), bool):
+            errors.append(f"{case_id or label}: required must be boolean")
+        if not isinstance(case.get("evidence"), list):
+            errors.append(f"{case_id or label}: evidence must be an array")
+    return errors
+
+
+def verify(args: argparse.Namespace) -> int:
+    manifest = args.manifest.resolve()
+    data = load_manifest(manifest)
+    errors = validate_manifest(data, args.release)
+    if errors:
+        for error in errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        return 1
+
+    evidence_root = evidence_root_for(manifest, data)
+    selected_phases = {"prepublish"}
+    if args.phase == "final":
+        selected_phases.add("postpublish")
+
+    # Checked BEFORE the cases, and in both phases: a manifest whose artifact
+    # digest does not describe the file on disk is wrong whether or not any
+    # case has been recorded yet.
+    artifact_problems = artifact_errors(data, manifest)
+    artifact_digest = (data.get("artifact") or {}).get("iso_sha256") or ""
+    if args.allow_pending:
+        for problem in artifact_problems:
+            print(f"REPORT: {problem}")
+    else:
+        errors.extend(artifact_problems)
+
+    selected = [
+        case
+        for case in data["cases"]
+        if case["required"] and case["phase"] in selected_phases
+    ]
+    for case in selected:
+        case_id = case["id"]
+        status = case["status"]
+        if status == "waived":
+            # Structure already validated: approver and reason are present.
+            print(
+                f"WAIVED: {case_id}: {case['waiver']['reason']} "
+                f"(approved by {case['waiver']['approver']})"
+            )
+            continue
+        if status != "pass":
+            if not args.allow_pending or status != "pending":
+                errors.append(
+                    f"{case_id}: required status is {status}, not pass or waived"
+                )
+            elif args.allow_pending:
+                print(f"REPORT: {case_id}: status is pending, no evidence recorded")
+            continue
+        evidence = case["evidence"]
+        if not evidence:
+            errors.append(f"{case_id}: passing case has no evidence")
+            continue
+        for index, item in enumerate(evidence):
+            label = f"{case_id}.evidence[{index}]"
+            if not isinstance(item, dict):
+                errors.append(f"{label}: entry must be an object")
+                continue
+            kind = item.get("kind")
+            path_value = item.get("path")
+            expected_hash = item.get("sha256")
+            if kind not in VALID_KINDS:
+                errors.append(f"{label}: invalid kind {kind!r}")
+                continue
+            if not isinstance(path_value, str) or not path_value:
+                errors.append(f"{label}: path must be a non-empty string")
+                continue
+            if not isinstance(expected_hash, str) or len(expected_hash) != 64:
+                errors.append(f"{label}: sha256 must contain 64 hexadecimal characters")
+                continue
+            try:
+                evidence_path = resolve_evidence(evidence_root, path_value)
+            except ValueError as exc:
+                errors.append(f"{label}: {exc}")
+                continue
+            if not evidence_path.is_file():
+                errors.append(f"{label}: missing file {evidence_path}")
+                continue
+            actual_hash = sha256_file(evidence_path)
+            if actual_hash != expected_hash.lower():
+                errors.append(
+                    f"{label}: SHA-256 mismatch, expected {expected_hash}, got {actual_hash}"
+                )
+            # BOUND TO THE ARTIFACT, or it is evidence about nothing. An entry
+            # was {kind, path, sha256} and nothing more: the size and entropy
+            # floors below stop a 0-byte file and a blank screenshot, and they
+            # cannot tell a real result from a plausible-looking one. ICE-01, a
+            # REQUIRED case, passed on twelve bytes reading b'ice\noffline\n'
+            # -- over the 8-byte floor, over the 1.5-bit entropy floor, and
+            # about no particular image. The VM harness has always bound its
+            # receipts to the artifact digest; this is the manifest learning to
+            # ask for the same thing.
+            bound = item.get("artifact_sha256")
+            if not isinstance(bound, str) or len(bound) != 64:
+                errors.append(
+                    f"{label}: no artifact_sha256, so this evidence is not "
+                    "about any particular image; re-record it against the "
+                    "artifact under test")
+            elif bound.lower() != str(artifact_digest).lower():
+                errors.append(
+                    f"{label}: recorded against artifact {bound[:16]}..., but "
+                    f"this manifest is about {str(artifact_digest)[:16]}...")
+            errors.extend(
+                f"{label}: {error}"
+                for error in evidence_quality_errors(evidence_path, kind)
+            )
+            if kind == "screenshot":
+                try:
+                    width, height = png_size(evidence_path)
+                except ValueError as exc:
+                    errors.append(f"{label}: {exc}")
+                else:
+                    if width < 1280 or height < 720:
+                        errors.append(
+                            f"{label}: screenshot is {width}x{height}, below 1280x720"
+                        )
+
+    if not args.allow_pending:
+        artifact = data.get("artifact")
+        if not isinstance(artifact, dict):
+            errors.append("artifact must be an object")
+        else:
+            required_artifact_fields = (
+                "iso_path",
+                "iso_sha256",
+                "iso_size_bytes",
+                "signature_path",
+                "signing_fingerprint",
+                "evidence_bundle_path",
+                "evidence_bundle_sha256",
+            )
+            for field in required_artifact_fields:
+                if artifact.get(field) in (None, "", 0):
+                    errors.append(f"artifact.{field} is not recorded")
+
+    if errors:
+        for error in errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        print(
+            f"ACCEPTANCE_FAILED phase={args.phase} errors={len(errors)}",
+            file=sys.stderr,
+        )
+        return 1
+
+    passed = sum(1 for case in selected if case["status"] == "pass")
+    pending = sum(1 for case in selected if case["status"] == "pending")
+    waived = sum(1 for case in selected if case["status"] == "waived")
+    print(
+        f"ACCEPTANCE_PASSED phase={args.phase} required={len(selected)} "
+        f"passed={passed} waived={waived} pending={pending} "
+        f"evidence_root={evidence_root}"
+    )
+    return 0
+
+
+def record(args: argparse.Namespace) -> int:
+    manifest = args.manifest.resolve()
+    data = load_manifest(manifest)
+    errors = validate_manifest(data, args.release)
+    if errors:
+        raise ValueError("; ".join(errors))
+    matching = [case for case in data["cases"] if case["id"] == args.case_id]
+    if not matching:
+        raise ValueError(f"unknown case id: {args.case_id}")
+    case = matching[0]
+    case["status"] = args.status
+    if args.notes is not None:
+        case["notes"] = args.notes
+
+    waiver_reason = getattr(args, "waiver_reason", None)
+    waiver_approver = getattr(args, "waiver_approver", None)
+    packages_under_test = package_index_stamp(data)
+    if args.status == "waived":
+        case["waiver"] = {
+            "approver": waiver_approver or "",
+            "reason": waiver_reason or "",
+            # A decision to accept a gap is about particular packages too.
+            **packages_under_test,
+        }
+        problems = waiver_errors(case)
+        if problems:
+            raise ValueError(
+                "a waived case requires --waiver-approver and --waiver-reason: "
+                + "; ".join(problems)
+            )
+    elif waiver_reason is not None or waiver_approver is not None:
+        raise ValueError("--waiver-approver/--waiver-reason require --status waived")
+
+    if args.clear_evidence:
+        case["evidence"] = []
+    unbound: list[str] = []
+    if args.evidence:
+        evidence_root = evidence_root_for(manifest, data)
+        evidence_root.mkdir(parents=True, exist_ok=True)
+        recorded = []
+        for source in args.evidence:
+            source = source.resolve()
+            if not source.is_file():
+                raise ValueError(f"evidence file does not exist: {source}")
+            try:
+                relative = source.relative_to(evidence_root)
+            except ValueError as exc:
+                raise ValueError(
+                    f"evidence must be inside {evidence_root}: {source}"
+                ) from exc
+            kind = args.kind
+            if kind is None:
+                kind = "screenshot" if source.suffix.lower() == ".png" else "log"
+            problems = evidence_quality_errors(source, kind)
+            if problems:
+                raise ValueError(f"unusable evidence {source}: " + "; ".join(problems))
+            entry = {
+                "kind": kind,
+                "path": relative.as_posix(),
+                "sha256": sha256_file(source),
+            }
+            # Stamped here, from the manifest, so a person cannot forget it and
+            # cannot choose it. Recording before the artifact exists is allowed
+            # -- the source gate runs before an image is cut -- but it produces
+            # UNBOUND evidence, which a strict verify refuses, so such a case
+            # has to be re-recorded against the image it is meant to be about.
+            digest = (data.get("artifact") or {}).get("iso_sha256")
+            if isinstance(digest, str) and len(digest) == 64:
+                entry["artifact_sha256"] = digest.lower()
+            else:
+                unbound.append(relative.as_posix())
+            entry.update(packages_under_test)
+            recorded.append(entry)
+        case["evidence"] = recorded
+
+    if args.status == "pass" and not case["evidence"]:
+        raise ValueError("a passing case must have at least one evidence file")
+    save_manifest(manifest, data)
+    print(
+        f"RECORDED case={args.case_id} status={args.status} "
+        f"evidence={len(case['evidence'])}"
+    )
+    if unbound:
+        # Said loudly, at the moment it happens, rather than discovered at the
+        # gate weeks later. This recording will not satisfy `verify`.
+        print(
+            "UNBOUND: this manifest records no artifact digest, so "
+            + ", ".join(unbound)
+            + " is evidence about no particular image. Record the artifact "
+              "first, then re-record this case.",
+            file=sys.stderr)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    gate.add_version_argument(parser)
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help="acceptance manifest; defaults to qa/<version>/acceptance.json",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    verify_parser = subparsers.add_parser("verify", help="verify recorded evidence")
+    verify_parser.add_argument("--phase", choices=("prepublish", "final"), default="prepublish")
+    verify_parser.add_argument(
+        "--allow-pending",
+        action="store_true",
+        help="validate structure and recorded passes without failing pending cases",
+    )
+    verify_parser.set_defaults(func=verify)
+
+    # Soft reporting path: structure plus recorded passes, pending cases listed.
+    audit_parser = subparsers.add_parser(
+        "acceptance-audit",
+        aliases=["audit"],
+        help="report on the manifest without failing on pending cases",
+    )
+    audit_parser.add_argument(
+        "--phase", choices=("prepublish", "final"), default="prepublish"
+    )
+    audit_parser.set_defaults(func=verify, allow_pending=True)
+
+    # Hard gate: every required case must be pass or waived, artifact fully recorded.
+    gate_parser = subparsers.add_parser(
+        "acceptance-gate",
+        aliases=["gate"],
+        help="fail unless every required case is pass or waived",
+    )
+    gate_parser.add_argument(
+        "--phase", choices=("prepublish", "final"), default="prepublish"
+    )
+    gate_parser.set_defaults(func=verify, allow_pending=False)
+
+    record_parser = subparsers.add_parser("record", help="record one case result")
+    record_parser.add_argument("case_id")
+    record_parser.add_argument("--status", choices=sorted(VALID_STATUSES), required=True)
+    record_parser.add_argument("--evidence", action="append", type=Path)
+    record_parser.add_argument("--kind", choices=sorted(VALID_KINDS))
+    record_parser.add_argument("--notes")
+    record_parser.add_argument(
+        "--waiver-approver", help="who accepted the gap (required for --status waived)"
+    )
+    record_parser.add_argument(
+        "--waiver-reason", help="written reason (required for --status waived)"
+    )
+    record_parser.add_argument("--clear-evidence", action="store_true")
+    record_parser.set_defaults(func=record)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        args.release = gate.load_release(args.version)
+        if args.manifest is None:
+            args.manifest = args.release.acceptance_manifest()
+        return args.func(args)
+    except (OSError, ValueError, json.JSONDecodeError, RuntimeError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

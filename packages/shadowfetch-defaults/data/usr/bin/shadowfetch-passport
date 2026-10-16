@@ -20,6 +20,12 @@ import json
 import os
 import re
 import shutil
+
+# Only root-owned directories. PATH belongs to whoever launched us, and on a
+# stock install ~/.local/bin precedes /usr/bin and is writable by the desktop
+# user, so a program resolved through it cannot be trusted to report a security
+# fact about the machine.
+TRUSTED_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 import subprocess
 import sys
 import time
@@ -79,7 +85,7 @@ def _read_json(path: Path) -> dict | None:
 
 
 def _facts_command() -> list[str] | None:
-    installed = shutil.which("shadowfetch-facts")
+    installed = shutil.which("shadowfetch-facts", path=TRUSTED_PATH)
     if installed:
         return [installed, "--json"]
     sibling = Path(__file__).with_name("shadowfetch-facts")
@@ -90,7 +96,9 @@ def _facts_command() -> list[str] | None:
 
 def _hwscan_command() -> list[str] | None:
     for candidate in (
-        shutil.which("shadowfetch-hwscan"),
+        # /usr/libexec first; PATH never. These hardware facts are half of
+        # the attestation the Passport publishes.
+        shutil.which("shadowfetch-hwscan", path=TRUSTED_PATH),
         "/usr/libexec/shadowfetch-hwscan",
     ):
         if candidate and os.access(candidate, os.X_OK):
@@ -393,7 +401,7 @@ def _memory_check(facts: dict) -> tuple[dict, float | None]:
     if total < 4:
         status, summary = "attention", f"{total:g} GiB RAM detected; 4 GiB is the minimum target."
     elif total < 8:
-        status, summary = "note", f"{total:g} GiB RAM detected; the desktop will run, with limited local AI capacity."
+        status, summary = "note", f"{total:g} GiB RAM detected; the desktop will run, with limited capacity for large workloads."
     else:
         status, summary = "ready", f"{total:g} GiB RAM detected."
     return _check("memory", "Memory", status, summary, "local memory probe"), total
@@ -526,40 +534,6 @@ def _packages_check(facts: dict, live: bool) -> dict:
                   "local package and service probes")
 
 
-def _local_ai_check(hwscan: dict | None) -> dict:
-    if not isinstance(hwscan, dict):
-        return _check("local-ai", "Local AI", "unknown",
-                      "Local AI capacity could not be ranked.",
-                      "local Shadowfetch hardware scan", "local-ai", "Open Local AI")
-    verdict = hwscan.get("verdict") if isinstance(hwscan.get("verdict"), dict) else {}
-    sentence = str(verdict.get("sentence") or "").strip()
-    suffixes = verdict.get("suffixes") if isinstance(verdict.get("suffixes"), list) else []
-    missing_driver = any(
-        isinstance(gpu, dict) and "missing-driver" in (gpu.get("flags") or [])
-        for gpu in (hwscan.get("gpus") or [])
-    )
-    if not sentence:
-        return _check("local-ai", "Local AI", "unknown",
-                      "Local AI capacity could not be ranked.",
-                      "local Shadowfetch hardware scan", "local-ai", "Open Local AI")
-    summary = sentence
-    if suffixes:
-        if summary[-1] not in ".!?":
-            summary += "."
-        formatted_suffixes = []
-        for item in suffixes[:3]:
-            suffix = str(item).strip()
-            if not suffix:
-                continue
-            suffix = suffix[:1].upper() + suffix[1:]
-            if suffix[-1] not in ".!?":
-                suffix += "."
-            formatted_suffixes.append(suffix)
-        if formatted_suffixes:
-            summary += " " + " ".join(formatted_suffixes)
-    status = "attention" if missing_driver else "ready"
-    return _check("local-ai", "Local AI", status, summary[:420],
-                  "local Shadowfetch hardware scan", "local-ai", "Open Local AI")
 
 
 def privacy_issues(document: object) -> list[str]:
@@ -612,7 +586,6 @@ def build_passport(facts: dict, hwscan: dict | None, probes: dict,
         _storage_check(facts, probes, live),
         _recovery_check(facts, live),
         _packages_check(facts, live),
-        _local_ai_check(hwscan),
     ]
 
     statuses = [item["status"] for item in checks]
@@ -725,11 +698,11 @@ def html_report(document: dict) -> str:
 <style>
 body{margin:0;background:#0b0e12;color:#e6e9ed;font:16px system-ui,sans-serif}
 main{max-width:920px;margin:auto;padding:48px 24px 64px}h1{font-size:36px;margin:8px 0}
-.eyebrow{color:#d8a24a;font-weight:700}.hero{border-bottom:1px solid #2c333b;padding-bottom:28px}
+.eyebrow{color:#f2b33d;font-weight:700}.hero{border-bottom:1px solid #2c333b;padding-bottom:28px}
 .verdict{font-size:21px}.check{background:#141922;border:1px solid #2c333b;border-radius:8px;
 padding:18px;margin:12px 0}.row{display:flex;gap:16px;align-items:center;justify-content:space-between}
 h2{font-size:18px;margin:0}.row span{font-weight:700}.ready .row span{color:#7fb069}
-.attention .row span{color:#e2533b}.note .row span{color:#d8a24a}
+.attention .row span{color:#e2533b}.note .row span{color:#f2b33d}
 .unknown .row span,.not-present .row span,small{color:#9aa3ad}p{line-height:1.5}
 .privacy{margin-top:28px;padding-top:20px;border-top:1px solid #2c333b;color:#9aa3ad}
 </style></head><body><main><header class="hero"><div class="eyebrow">SHADOWFETCH GUIDE</div>

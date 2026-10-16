@@ -1,6 +1,10 @@
-# Fire Edition 2.1.5 local AI and rootless Buzz relay prerequisites.
+# Rootless containers and offline project-workspace prerequisites.
 podman
 podman-compose
 uidmap
 slirp4netns
 fuse-overlayfs
+# 5.0.0: ShadowCode's agent sandbox. shadow-code only Recommends it, so it
+# arrived through --apt-recommends alone; declared so a Recommends change or a
+# --no-install-recommends build cannot silently drop the sandbox.
+bubblewrap

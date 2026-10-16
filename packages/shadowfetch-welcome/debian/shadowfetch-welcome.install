@@ -1,7 +1,8 @@
 src/shadowfetch-welcome usr/bin/
-data/shadowfetch-welcome.desktop usr/share/applications/
+data/menu/shadowfetch-welcome.desktop usr/share/applications/
 data/shadowfetch-welcome.desktop etc/xdg/autostart/
 data/usr/libexec/shadowfetch-bundle-install usr/libexec/
 data/usr/libexec/shadowfetch-ignition-state usr/libexec/
 data/usr/share/polkit-1/actions/org.shadowfetch.ignition.policy usr/share/polkit-1/actions/
 data/usr/share/shadowfetch/welcome/catalog/*.json usr/share/shadowfetch/welcome/catalog/
+data/usr/share/shadowfetch/welcome/check.svg usr/share/shadowfetch/welcome/

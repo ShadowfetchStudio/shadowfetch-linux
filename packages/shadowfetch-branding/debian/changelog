@@ -1,3 +1,46 @@
+shadowfetch-branding (5.0.1-1) umbra; urgency=medium
+
+  * Report 5.0.1 (Umbra) in os-release and /usr/share/shadowfetch/version.
+
+ -- Shadowfetch Project <signing@shadowfetch.com>  Wed, 30 Sep 2026 23:15:00 -0400
+
+shadowfetch-branding (5.0.0-1) umbra; urgency=medium
+
+  * Shadowfetch Linux 5.0.0, edition ShadowCode. os-release and
+    /usr/share/shadowfetch/version report 5.0.0 (Umbra); BUG_REPORT_URL
+    points at github.com/Shadowfetchapps/shadowfetch-linux.
+  * ShadowCode: new default wallpaper, the ShadowCode wallpaper set and
+    /usr/share/backgrounds/shadowfetch/shadowcode-4k.jpg; the gold and steel
+    emblem in the logos, icons and Plymouth splash, whose wordmark is now
+    two-tone (SHADOWFETCH gold, LINUX silver) on near-black.
+  * Remove the Fire/Ice-era wallpapers UmbraFire, UmbraIce, UmbraFrost,
+    UmbraDrift and UmbraGold, and umbra-4k.jpg and umbra-ice-4k.jpg; delete
+    the never-shipped UmbraEmblem and UmbraVault sets and with them
+    debian/not-installed. UmbraContour, UmbraDusk, UmbraEmber and
+    UmbraGraphite stay as extras.
+
+ -- Shadowfetch Project <signing@shadowfetch.com>  Mon, 28 Sep 2026 18:30:00 -0400
+
+shadowfetch-branding (4.1.0-1) umbra; urgency=medium
+
+  * Report 4.1.0 in os-release and /usr/share/shadowfetch/version.
+  * Declare the UmbraEmblem and UmbraVault wallpaper sets unshipped. They
+    have been in this data tree since 2.1.4, have never been in the install
+    file, and nothing in the tree references either id -- not the
+    look-and-feel defaults, not Welcome, not the element themes -- so
+    shipping them now would add 2.6 MB of unreferenced payload to an image
+    already close to the 4 GiB squashfs ceiling. Declaring them lets
+    dh_missing and the ship-list check see the decision rather than silence.
+
+ -- Shadowfetch Project <signing@shadowfetch.com>  Wed, 09 Sep 2026 18:28:58 -0400
+
+shadowfetch-branding (4.0.0-1) umbra; urgency=medium
+
+  * Shadowfetch Linux 4.0 Mission Control release.
+  * Integrate persistent missions, scoped execution and featured Grok Bot setup.
+
+ -- Shadowfetch Project <signing@shadowfetch.com>  Sat, 05 Sep 2026 03:00:00 +0000
+
 shadowfetch-branding (3.5.0-1) umbra; urgency=medium
 
   * Shadowfetch Linux 3.5.0 flagship Fire and Ice Workbench release.

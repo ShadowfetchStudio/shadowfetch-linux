@@ -5,12 +5,20 @@ Fireproof's contract, all of it enforced in this one process:
 
   * ANALYZE IS SIDE-EFFECT FREE. Opening the analyze screen takes no apt
     lock and downloads nothing. The pending upgrade is simulated with
-    python3-apt on a read-only cache (same libapt-pkg as apt itself, so
-    the resolver answers identically to `apt full-upgrade`), a
-    safe-upgrade diff yields the kept-back story, holds surface as
+    python3-apt on a read-only cache (libapt-pkg's classic dist-upgrade
+    resolver, which is NOT the solver `apt full-upgrade` uses in apt 3),
+    a safe-upgrade diff yields the kept-back story, holds surface as
     "pinned, will not update", and library renames (libfoo1 -> libfoo1t64)
     collapse to one "same library, new name" line. NEWS is lazy: nothing
     is fetched at analyze time.
+
+  * AN UPDATE NEVER REMOVES WHAT THE PERSON DID NOT ASK TO REMOVE. When
+    the full resolution would remove a package (a Debian testing library
+    transition), plan_update() holds the affected upgrades back instead and
+    the analysis says which and why. The only removals allowed are
+    retirements an incoming shadowfetch-* package's own Conflicts/Breaks
+    require, of automatically installed packages, never
+    shadowfetch-desktop or shadowfetch-creative-base.
 
   * THE LOCK IS TAKEN ONLY AT COMMIT. When the user clicks Update we
     acquire /var/lib/dpkg/lock-frontend, re-run the simulation and
@@ -45,14 +53,14 @@ import glob
 import hashlib
 import json
 import os
-import shutil
 import signal
-import subprocess
 import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlsplit
 
 if any(a in ("-h", "--help") for a in sys.argv[1:]):
     print(__doc__)
@@ -64,6 +72,19 @@ if "--version" in sys.argv[1:]:
         v = "unknown"
     print("fireproofd (Shadowfetch Linux) " + v)
     raise SystemExit(0)
+
+# Shared update logic. sfupdate lives beside phoenix under
+# /usr/lib/shadowfetch; the path is derived from this file's own location
+# (/usr/libexec/fireproofd -> /usr/lib/shadowfetch), which is true in the
+# source tree as well - never from PYTHONPATH, which the caller controls.
+_LIB = Path(__file__).resolve().parent.parent / "lib" / "shadowfetch"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+
+from sfupdate import snapshots as sfsnap                          # noqa: E402
+from sfupdate import state as sfstate                             # noqa: E402
+from sfupdate.trusted import (                                    # noqa: E402
+    EXECUTOR, SECURITY_CRITICAL, ExecutableError, ExecutableTrust)
 
 import apt
 import apt.progress.base
@@ -78,9 +99,15 @@ OBJ_PATH = "/org/shadowfetch/Fireproof1"
 IFACE = "org.shadowfetch.Fireproof1"
 ACTION_UPDATE = "org.shadowfetch.fireproof.update"
 
-STATE_DIR = "/var/lib/shadowfetch"
-STATE_FILE = os.path.join(STATE_DIR, "fireproof-state.json")
-PENDING_FILE = os.path.join(STATE_DIR, "fireproof-pending")
+# The state store is sfupdate.state and nothing else: one place decides
+# what the last update did to this machine, because ROLLBACK reads
+# pre_point from it and hands that number to phoenix-restore.
+STATE_DIR = sfstate.STATE_DIR
+STATE_FILE = sfstate.STATE_FILE
+PENDING_FILE = sfstate.PENDING_FILE
+# Analyze is unauthenticated by design (the tray badge needs it), so the
+# work it triggers has to be bounded rather than gated. W-21.
+ANALYZE_CACHE_SECONDS = 30
 LOCK_FRONTEND = "/var/lib/dpkg/lock-frontend"
 
 # RED classifier: packages whose failure can cost the boot, the session or
@@ -95,6 +122,25 @@ MAJOR_DOWNLOAD_BYTES = 500 * 1000 * 1000
 MAJOR_PACKAGE_COUNT = 300
 MAJOR_REMOVAL_COUNT = 10
 
+# NO SIDE-EFFECT REMOVALS. An update never removes a package the person did
+# not ask to remove. Debian testing moves in library transitions: for a few
+# days some upgrades can only be installed by removing packages that still
+# need the old library. QA 5.0.1 watched Fireproof's full resolution plan to
+# remove krita, kdenlive, shadowfetch-desktop and shadowfetch-creative-base
+# (14-16 removals) where `apt full-upgrade` held 12 packages back and removed
+# nothing. plan_update() now holds those upgrades back instead.
+#
+# The one kind of removal an update may make is a RETIREMENT: a package that
+# an incoming shadowfetch-* package's own Conflicts or Breaks requires to go,
+# that was installed automatically, and that is not one of these:
+PROTECTED_PACKAGES = frozenset(("shadowfetch-desktop",
+                                "shadowfetch-creative-base"))
+RETIRING_PREFIX = "shadowfetch-"
+# Rounds of "keep the refused removals, hold back what then breaks". One is
+# normally enough; holding back can uncover another refused removal.
+MAX_HOLD_BACK_ROUNDS = 8
+HELD_BACK_REASON = "debian-transition"
+
 NVIDIA_LOCKSTEP = "550.163.01"
 
 # needrestart-detected services we never restart from the verify battery:
@@ -108,6 +154,28 @@ GRAPHICS_BINARIES = (
     "/usr/bin/sddm", "/usr/bin/kwin_wayland", "/usr/bin/plasmashell",
     "/usr/bin/Xwayland",
 )
+
+# An interrupted dpkg run (a killed upgrade, a power cut, a failed maintainer
+# script) leaves packages unpacked but not configured. Fireproof's change set
+# is computed against what dpkg says is installed, so on such a system it is
+# not the update the user would get: apt has to finish dpkg's work first, and
+# a normal update on top is how QA 5.0.1 watched a retry die on the same
+# package. Analyze reports the state and this command instead of an update,
+# and the commit refuses it under the lock.
+REPAIR_COMMAND = "sudo dpkg --configure -a && sudo apt -f install"
+# libapt's pkgCache::State::PkgCurrentState and PkgInstState. python3-apt does
+# not export the trigger states, so the numbers are spelled out here.
+_CURSTATE_LABELS = {
+    getattr(apt_pkg, "CURSTATE_UNPACKED", 1): "unpacked, not configured",
+    getattr(apt_pkg, "CURSTATE_HALF_CONFIGURED", 2): "half-configured",
+    getattr(apt_pkg, "CURSTATE_HALF_INSTALLED", 4): "half-installed",
+    7: "awaiting trigger processing",
+    8: "trigger processing pending",
+}
+_REINSTREQ_STATES = {
+    getattr(apt_pkg, "INSTSTATE_REINSTREQ", 1),
+    getattr(apt_pkg, "INSTSTATE_HOLD_REINSTREQ", 3),
+}
 
 
 # --------------------------------------------------------------------------
@@ -143,105 +211,187 @@ def log(msg):
     print("fireproofd: %s" % msg, file=sys.stderr, flush=True)
 
 
-def now_iso():
-    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+# One implementation each, in sfupdate.state.
+now_iso = sfstate.now_iso
+atomic_write = sfstate.atomic_write
+load_state = sfstate.load_state
+save_state = sfstate.save_state
+
+# A program that could not be TRUSTED gets a distinguished status so that
+# no caller can mistake "I could not establish this fact" for "the check
+# passed". Nothing here shells out, so this cannot collide with a real
+# child's exit status.
+UNTRUSTED_RC = 126
 
 
 def run(cmd, timeout=30):
-    """Run a command, never raise; return (rc, stdout, stderr).
+    """Run a TRUSTED program; never raise. Returns (rc, stdout, stderr).
 
-    LC_ALL=C / LANG=C always: several callers parse the output (apt's
-    "0 upgraded, ..." line, needrestart, snapper CSV), and a translated
-    message must never flip a verify check from pass to warn.
+    cmd[0] is a NAME in sfupdate.trusted.TRUSTED_PATHS - not a path, and
+    never something to look up in PATH. This daemon is root on the system
+    bus and every program it runs decides a security fact: which snapshot
+    number is offered to phoenix-restore, whether the verify battery says
+    "ok" or "restore-recommended", which services get restarted as root.
+    A substitutable snapper picks the user's root subvolume; a
+    substitutable dpkg/apt-get forges a clean verdict on a machine the
+    update just broke.
+
+    The executor pins the CHILD's PATH too. Resolving the program is not
+    enough: needrestart and update-grub are scripts that resolve their own
+    helpers through whatever PATH they inherit.
     """
-    env = dict(os.environ, LC_ALL="C", LANG="C", LANGUAGE="C")
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                           env=env)
-        return p.returncode, p.stdout, p.stderr
-    except subprocess.TimeoutExpired:
-        return 124, "", "timeout"
-    except OSError as e:
-        return 127, "", str(e)
+        return EXECUTOR.run(cmd[0], *cmd[1:], timeout=timeout)
+    except ExecutableError as e:
+        return UNTRUSTED_RC, "", str(e)
 
 
-def atomic_write(path, text):
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+def untrusted(rc):
+    """Did this call fail because no trusted program could be resolved?"""
+    return rc == UNTRUSTED_RC
 
 
-def load_state():
+def is_substitutable(name):
+    """The program exists but somebody other than root can replace it.
+
+    Distinct from absent on purpose. An absent optional tool (no dkms on a
+    machine with no out-of-tree modules) is a legitimate skip. A present
+    but substitutable one is a finding, and must be reported rather than
+    quietly skipped as if it had never been installed.
+    """
     try:
-        with open(STATE_FILE) as f:
-            st = json.load(f)
-        if isinstance(st, dict):
-            st.setdefault("schema", 1)
-            st.setdefault("failed_sets", [])
-            st.setdefault("last_txn", None)
-            return st
-    except (OSError, ValueError):
-        pass
-    return {"schema": 1, "failed_sets": [], "last_txn": None}
+        _path, verdict = EXECUTOR.trust(name)
+    except ExecutableError:
+        return False
+    return verdict is ExecutableTrust.UNTRUSTED
 
 
-def save_state(state):
-    os.makedirs(STATE_DIR, exist_ok=True)
-    atomic_write(STATE_FILE, json.dumps(state, indent=1, sort_keys=True) + "\n")
+def trust_note(name):
+    """Why a program was refused - for the check row that has to say so."""
+    return EXECUTOR.explain(name)
 
 
 # --------------------------------------------------------------------------
 # snapper helpers (read + relabel only; Fireproof never CREATES snapshots)
 # --------------------------------------------------------------------------
 
-def snapper_list():
-    """Return [(number, type, date, description)] or [] when unavailable."""
-    rc, out, _ = run(["snapper", "-c", "root", "--machine-readable", "csv",
-                      "list", "--columns", "number,type,date,description"], timeout=20)
-    rows = []
-    if rc == 0:
-        for line in out.splitlines()[1:]:
-            parts = line.split(",", 3)
-            if len(parts) >= 2 and parts[0].isdigit():
-                rows.append((int(parts[0]), parts[1].strip(),
-                             parts[2].strip() if len(parts) > 2 else "",
-                             parts[3].strip() if len(parts) > 3 else ""))
-    return rows
-
+# THE ONE implementation of "which Phoenix Point precedes this update"
+# is sfupdate.snapshots. It used to exist twice - here and in
+# shadowfetch-update's awk - with two labels and two records, so a
+# rollback after a shadowfetch-update run restored the PREVIOUS
+# transaction's Point. These three names stay as the daemon's local
+# vocabulary; the mechanism is shared.
 
 def snapper_max_number():
-    rows = snapper_list()
-    return max((n for n, _t, _d, _desc in rows), default=0)
+    return sfsnap.max_number()
 
 
 def snapper_first_pre_after(n):
     """The rollback target: FIRST type=pre snapshot with number > n."""
-    pres = sorted(num for num, typ, _d, _desc in snapper_list()
-                  if typ == "pre" and num > n)
-    return pres[0] if pres else None
+    return sfsnap.first_pre_after(n)
 
 
 def phoenix_available():
-    """Btrfs root + snapper config + apt snapshots not disabled."""
-    rc, out, _ = run(["findmnt", "-n", "-o", "FSTYPE", "/"], timeout=5)
-    if rc != 0 or out.strip() != "btrfs":
-        return False
-    if not os.path.exists("/etc/snapper/configs/root"):
-        return False
+    """Btrfs root + snapper config + apt snapshots on + a TRUSTED snapper."""
+    return sfsnap.phoenix_available()
+
+
+# --------------------------------------------------------------------------
+# mirror hosts: a HOSTNAME, never host:port
+# --------------------------------------------------------------------------
+
+def uri_hostname(uri):
+    """The host apt fetched from, without port, credentials or brackets.
+
+    The verify battery asks `getent hosts` whether the mirror still resolves.
+    It used to be handed the URI's whole authority, so a mirror with a port
+    (http://10.0.2.2:8816/, http://mirror.lan:3142/ behind apt-cacher-ng)
+    was looked up as the NAME "10.0.2.2:8816" and reported as not resolving.
+    file:, cdrom: and copy: URIs have no host and give None.
+    """
     try:
-        with open("/etc/default/snapper") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("DISABLE_APT_SNAPSHOT"):
-                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    if val.lower() in ("yes", "true", "1"):
-                        return False
-    except OSError:
-        pass
-    return True
+        host = urlsplit(str(uri)).hostname
+    except ValueError:
+        return None
+    return host or None
+
+
+def mirror_hostname(value):
+    """Normalise a recorded mirror host. State written by an older daemon
+    can still hold "host:port"; a bare IPv6 address is left alone."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    if "://" in value:
+        return uri_hostname(value)
+    if value.startswith("["):
+        return uri_hostname("//" + value)
+    if value.count(":") == 1:
+        host, _, port = value.partition(":")
+        if port.isdigit():
+            return host or None
+    return value
+
+
+# --------------------------------------------------------------------------
+# interrupted dpkg runs: report the repair, never offer an update on top
+# --------------------------------------------------------------------------
+
+def interrupted_packages(cache):
+    """Packages dpkg left mid-way, from the apt cache: [{name, state}]."""
+    found = []
+    for pkg in cache:
+        raw = getattr(pkg, "_pkg", None)
+        if raw is None:
+            continue
+        current = getattr(raw, "current_state", None)
+        inst = getattr(raw, "inst_state", None)
+        if inst in _REINSTREQ_STATES:
+            found.append({"name": pkg.name, "state": "reinstall required"})
+        elif current in _CURSTATE_LABELS:
+            found.append({"name": pkg.name,
+                          "state": _CURSTATE_LABELS[current]})
+    return sorted(found, key=lambda p: p["name"])
+
+
+def dpkg_audit():
+    """(text, established): what `dpkg --audit` reports, read-only.
+
+    Its output is the authority: it also covers what the cache scan cannot
+    see (a missing file list, a package dpkg itself cannot account for)."""
+    rc, out, err = run(["dpkg", "--audit"], timeout=60)
+    if untrusted(rc):
+        return "", False
+    if out.strip():
+        return out.strip()[:2000], True
+    if rc != 0:
+        return (err.strip() or "dpkg --audit exited %d" % rc)[:2000], True
+    return "", True
+
+
+def interrupted_report(cache, audit=None):
+    """None on a consistent system, else the refusal analyze and commit give."""
+    packages = interrupted_packages(cache)
+    audit_text, established = audit if audit is not None else dpkg_audit()
+    if not packages and not audit_text:
+        return None
+    count = len(packages)
+    if count:
+        what = ("%d package%s %s not finished installing"
+                % (count, "" if count == 1 else "s",
+                   "is" if count == 1 else "are"))
+    else:
+        what = "dpkg reports an unfinished package operation"
+    return {
+        "packages": packages,
+        "audit": audit_text,
+        "audit_established": established,
+        "repair_command": REPAIR_COMMAND,
+        "message": ("A previous update was interrupted: %s. Fireproof will "
+                    "not start a new update on top of it. Finish the "
+                    "interrupted one first by running:\n    %s\nthen check "
+                    "for updates again." % (what, REPAIR_COMMAND)),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -330,9 +480,197 @@ def change_set_hash(changes):
     return hashlib.sha256("\n".join(sorted(lines)).encode()).hexdigest()
 
 
-def build_analysis(state):
-    """Simulate the pending upgrade read-only and describe it honestly."""
-    cache = apt.Cache(apt.progress.base.OpProgress())
+def retirement_targets(changes):
+    """(name, version) of every installed version an incoming shadowfetch-*
+    package's own Conflicts or Breaks names: the removals Shadowfetch itself
+    asks for when it retires a package."""
+    targets = set()
+    for pkg in changes:
+        if (pkg.marked_delete or pkg.candidate is None
+                or not pkg.name.startswith(RETIRING_PREFIX)):
+            continue
+        for dep in pkg.candidate.get_dependencies("Conflicts", "Breaks"):
+            for alt in dep.or_dependencies:
+                for ver in alt.target_versions:
+                    targets.add((ver.package.name, ver.version))
+    return targets
+
+
+def removal_refusal(pkg, targets):
+    """Why Fireproof will not make this removal, or None when it may: only a
+    retirement, of a package installed automatically, that is not one of the
+    desktop metapackages."""
+    if pkg.name in PROTECTED_PACKAGES:
+        return "Shadowfetch metapackage, never removed by an update"
+    if not pkg.is_auto_installed:
+        return "installed by you, never removed by an update"
+    installed = pkg.installed.version if pkg.installed else None
+    if (pkg.name, installed) not in targets:
+        return "not retired by a Shadowfetch package"
+    return None
+
+
+def refused_removals(changes):
+    """[(pkg, reason)] for each removal in the change set Fireproof refuses."""
+    targets = retirement_targets(changes)
+    refused = []
+    for pkg in changes:
+        if pkg.marked_delete:
+            why = removal_refusal(pkg, targets)
+            if why:
+                refused.append((pkg, why))
+    return refused
+
+
+def _problem_resolver(cache):
+    return apt_pkg.ProblemResolver(cache._depcache)
+
+
+def _broken_count(cache):
+    return cache._depcache.broken_count
+
+
+def _drop_orphaned_installs(cache):
+    """Leave out new packages only the held-back upgrades wanted.
+
+    ResolveByKeep keeps back the broken upgrades, but the new packages
+    they pulled in are not broken themselves and stay marked: on the QA
+    5.0.1 system that was 25 new packages next to 0 upgrades. A new,
+    automatically chosen package that nothing in the plan needs any more is
+    garbage in libapt's own sense (MarkAndSweep, run when each action group
+    ends), so it is not installed -- as `apt full-upgrade` installs 0 new
+    packages there."""
+    while True:
+        orphans = [p for p in cache.get_changes()
+                   if p.marked_install and not p.installed
+                   and p.is_auto_removable]
+        if not orphans:
+            return
+        with cache.actiongroup():
+            for pkg in orphans:
+                pkg.mark_keep()
+
+
+def held_back_message(held, avoided):
+    """What the person is told when upgrades are held back."""
+    names = ", ".join(a["name"] for a in avoided[:8])
+    if len(avoided) > 8:
+        names += " and %d more" % (len(avoided) - 8)
+    one = len(held) == 1
+    if not held:
+        # Only new packages were left out; no installed package waits.
+        return ("Debian testing is in the middle of a library transition. "
+                "Part of this update would remove %d installed package%s "
+                "(%s), so Fireproof leaves it out and removes nothing. It "
+                "will arrive once the transition is complete in Debian "
+                "testing; you do not need to do anything."
+                % (len(avoided), "" if len(avoided) == 1 else "s", names))
+    return ("Debian testing is in the middle of a library transition. "
+            "Installing %d update%s now would remove %d installed package%s "
+            "(%s), so Fireproof holds %s back and removes nothing. %s will "
+            "update once the transition is complete in Debian testing; you "
+            "do not need to do anything."
+            % (len(held), "" if one else "s",
+               len(avoided), "" if len(avoided) == 1 else "s", names,
+               "it" if one else "them", "It" if one else "They"))
+
+
+def plan_update(cache):
+    """Mark the update Fireproof makes on `cache`, and describe what it held
+    back. Analyze and the commit both call this, so the change set the person
+    approves is the one re-checked under the lock.
+
+    1. The full resolution, as `apt full-upgrade`'s classic resolver would
+       (python3-apt's dist-upgrade).
+    2. If that removes anything removal_refusal() refuses: keep those
+       packages, protect them, and let libapt's ResolveByKeep hold back
+       exactly the upgrades and new packages that needed them gone. Repeat
+       while a round uncovers another refused removal.
+    3. If that still leaves a broken or refused plan, fall back to the safe
+       upgrade (`apt upgrade`), which never removes anything.
+
+    In memory only, like the rest of analyze: nothing is written until the
+    commit."""
+    cache.upgrade(dist_upgrade=True)
+    changes = cache.get_changes()
+    refused = refused_removals(changes)
+    if not refused:
+        return {"held_back": [], "avoided_removals": [], "fallback": None,
+                "message": None}
+
+    # Snapshot the full plan now: the package objects show the final marks
+    # once the plan is changed below.
+    full_upgrades = {p.name: (p.installed.version,
+                              p.candidate.version if p.candidate else None)
+                     for p in changes if p.installed and not p.marked_delete}
+    avoided = sorted(({"name": p.name,
+                       "installed": p.installed.version if p.installed else None,
+                       "reason": why} for p, why in refused),
+                     key=lambda a: a["name"])
+    avoided_names = {a["name"] for a in avoided}
+    fallback = "hold-back"
+    for _ in range(MAX_HOLD_BACK_ROUNDS):
+        if not refused:
+            break
+        with cache.actiongroup():
+            for pkg, _why in refused:
+                pkg.mark_keep()
+        resolver = _problem_resolver(cache)
+        for pkg, _why in refused:
+            resolver.protect(pkg._pkg)
+        resolver.resolve_by_keep()
+        refused = refused_removals(cache.get_changes())
+        for pkg, why in refused:
+            if pkg.name not in avoided_names:
+                avoided_names.add(pkg.name)
+                avoided.append({"name": pkg.name,
+                                "installed": pkg.installed.version
+                                if pkg.installed else None,
+                                "reason": why})
+        _drop_orphaned_installs(cache)
+    if refused or _broken_count(cache):
+        cache.clear()
+        cache.upgrade(dist_upgrade=False)
+        fallback = "safe-upgrade"
+    avoided.sort(key=lambda a: a["name"])
+
+    final = cache.get_changes()
+    if any(p.marked_delete and p.name in avoided_names for p in final):
+        raise RuntimeError("a refused removal survived update planning")
+    final_names = {p.name for p in final}
+    # Every installed package with a newer candidate that this plan leaves
+    # where it is (dpkg holds excepted: they are reported as holds), so the
+    # list matches what `apt full-upgrade` reports as kept back and the
+    # badge counts only what Update installs. The resolver's full plan does
+    # not touch every one of them, which is why the list is not just
+    # full_upgrades minus the final plan.
+    held_names = set(n for n in full_upgrades if n not in final_names)
+    for pkg in cache:
+        if (pkg.is_upgradable and pkg.name not in final_names
+                and pkg._pkg.selected_state != apt_pkg.SELSTATE_HOLD):
+            held_names.add(pkg.name)
+            full_upgrades.setdefault(pkg.name, (
+                pkg.installed.version,
+                pkg.candidate.version if pkg.candidate else None))
+    held = [{"name": name, "installed": full_upgrades[name][0],
+             "candidate": full_upgrades[name][1],
+             "reason": HELD_BACK_REASON}
+            for name in sorted(held_names)]
+    return {"held_back": held, "avoided_removals": avoided,
+            "fallback": fallback,
+            "message": held_back_message(held, avoided)}
+
+
+def build_analysis(state, cache=None, audit=None):
+    """Simulate the pending upgrade read-only and describe it honestly.
+
+    On a system an earlier dpkg run left half-configured, there is no honest
+    change set to offer: the analysis carries `interrupted` (the packages,
+    dpkg --audit's words and the repair command) and an empty change set,
+    so neither the CLI nor the page can present it as a normal update."""
+    if cache is None:
+        cache = apt.Cache(apt.progress.base.OpProgress())
+    interrupted = interrupted_report(cache, audit)
 
     holds = []
     upgradable = 0
@@ -349,13 +687,17 @@ def build_analysis(state):
                 "note": "pinned, will not update",
             })
 
+    if interrupted is not None:
+        return interrupted_analysis(interrupted, holds, upgradable)
+
     # Safe path first (upgrade without removals), for the kept-back story.
     cache.upgrade(dist_upgrade=False)
     safe_names = {p.name for p in cache.get_changes()}
     cache.clear()
 
-    # The full path the Update button would take.
-    cache.upgrade(dist_upgrade=True)
+    # The plan the Update button would take: the full resolution, minus any
+    # upgrade that needs a removal Fireproof refuses (plan_update).
+    plan = plan_update(cache)
     changes = cache.get_changes()
 
     installs, upgrades, removals = [], [], []
@@ -388,9 +730,15 @@ def build_analysis(state):
     full_names = {p.name for p in changes}
     kept = sorted(n for n in full_names if n not in safe_names and n in
                   {p.name for p in changes if not p.marked_install})
-    kept_story = ("full path removes %d; safe path skips %d"
-                  % (len(removals) + len(renames),
-                     len(full_names - safe_names)))
+    held = plan["held_back"]
+    if held:
+        kept_story = ("%d held back so nothing is removed (a Debian "
+                      "transition is in progress); safe path skips %d"
+                      % (len(held), len(full_names - safe_names)))
+    else:
+        kept_story = ("plan removes %d; safe path skips %d"
+                      % (len(removals) + len(renames),
+                         len(full_names - safe_names)))
 
     kernels = sorted(p["name"] for p in installs + upgrades
                      if p["name"].startswith("linux-image-"))
@@ -426,7 +774,15 @@ def build_analysis(state):
             "story": kept_story,
             "packages": kept,
         },
+        # Upgrades held back because they would remove packages (plan_update).
+        "held_back": {
+            "packages": held,
+            "avoided_removals": plan["avoided_removals"],
+            "fallback": plan["fallback"],
+            "message": plan["message"],
+        },
         "banners": {
+            "held_back": plan["message"],
             "major_transition": (download_bytes > MAJOR_DOWNLOAD_BYTES
                                  or total > MAJOR_PACKAGE_COUNT
                                  or len(removals) > MAJOR_REMOVAL_COUNT),
@@ -443,11 +799,51 @@ def build_analysis(state):
             "default_dont_proceed": bool(
                 same_set or any(p["red"] for p in installs + upgrades + removals)),
         },
-        "update_count": upgradable,
+        # Held-back upgrades do not count: the badge offers what Update does.
+        "update_count": max(0, upgradable - len(held)),
         "notify_suppressed": bool(same_set),
+        "interrupted": None,
     }
     cache.clear()
     return analysis
+
+
+def interrupted_analysis(interrupted, holds, upgradable):
+    """The analysis of a half-configured system: no change set, the repair.
+
+    Same schema as a normal analysis so every existing reader still parses
+    it, with nothing in it that could be approved: zero counts, no package
+    lists, and the hash of an empty change set (which a commit would refuse
+    under the lock anyway)."""
+    return {
+        "schema": 1,
+        "generated_at": now_iso(),
+        "change_set_hash": change_set_hash([]),
+        "counts": {"install": 0, "upgrade": 0, "remove": 0, "rename": 0,
+                   "total": 0, "download_bytes": 0, "space_bytes": 0},
+        "installs": [],
+        "upgrades": [],
+        "removals": [],
+        "library_renames": [],
+        "holds": holds,
+        "kept_back": {"story": "not computed: a previous update was "
+                               "interrupted", "packages": []},
+        "held_back": {"packages": [], "avoided_removals": [],
+                      "fallback": None, "message": None},
+        "banners": {
+            "held_back": None,
+            "major_transition": False,
+            "kernel": None,
+            "nvidia": None,
+            "same_set_rollback": None,
+            "phoenix_available": phoenix_available(),
+            "default_dont_proceed": True,
+            "interrupted": interrupted["message"],
+        },
+        "update_count": upgradable,
+        "notify_suppressed": False,
+        "interrupted": interrupted,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -463,8 +859,7 @@ class SignalAcquireProgress(apt.progress.base.AcquireProgress):
 
     def fetch(self, item):
         try:
-            uri = item.uri
-            host = uri.split("://", 1)[-1].split("/", 1)[0]
+            host = uri_hostname(item.uri)
             if host:
                 self._hosts.add(host)
         except Exception:
@@ -501,7 +896,16 @@ class SignalInstallProgress(apt.progress.base.InstallProgress):
 # --------------------------------------------------------------------------
 
 def failed_units():
-    rc, out, _ = run(["systemctl", "--failed", "--no-legend", "--plain"], timeout=10)
+    """Failed unit names, or None when systemctl could not be TRUSTED.
+
+    None, not []: an empty list is the answer "nothing is failing", and a
+    substitutable systemctl returning that would turn the newly-failed
+    check into a silent pass on a machine the update just broke.
+    """
+    rc, out, _ = run(["systemctl", "--failed", "--no-legend", "--plain"],
+                     timeout=10)
+    if untrusted(rc):
+        return None
     if rc not in (0, 1):
         return []
     return sorted(line.split()[0] for line in out.splitlines() if line.split())
@@ -528,8 +932,15 @@ def run_verify(txn):
                        "detail": detail})
 
     # (a) package database consistency
-    rc, out, _ = run(["dpkg", "--audit"], timeout=60)
-    if rc == 0 and not out.strip():
+    rc, out, err = run(["dpkg", "--audit"], timeout=60)
+    if untrusted(rc):
+        # Cannot be established, so it is not established. A refusal here
+        # leads with Restore rather than degrading to a warning: the whole
+        # point of this check is that a forged one hides a broken machine.
+        add("dpkg-audit", "Package database consistent", "fail",
+            "not established: %s" % err)
+        hard_fail = True
+    elif rc == 0 and not out.strip():
         add("dpkg-audit", "Package database consistent", "pass", "dpkg --audit is empty")
     else:
         add("dpkg-audit", "Package database consistent", "fail",
@@ -537,7 +948,11 @@ def run_verify(txn):
         hard_fail = True
 
     rc, out, err = run(["apt-get", "-s", "-f", "install"], timeout=120)
-    if rc == 0 and "0 upgraded, 0 newly installed, 0 to remove" in out:
+    if untrusted(rc):
+        add("apt-consistency", "No broken dependencies", "fail",
+            "not established: %s" % err)
+        hard_fail = True
+    elif rc == 0 and "0 upgraded, 0 newly installed, 0 to remove" in out:
         add("apt-consistency", "No broken dependencies", "pass",
             "apt-get -s -f install proposes no changes")
     elif rc == 0:
@@ -598,7 +1013,14 @@ def run_verify(txn):
 
     # (d) dkms modules on the new kernel (THE black-screen preventer with
     # nvidia-kernel-dkms; a dkms failure with nvidia involved is hard)
-    if new_kernels and shutil.which("dkms"):
+    if new_kernels and is_substitutable("dkms"):
+        # Present but substitutable. dkms decides whether an NVIDIA module
+        # failure - the black screen - is reported at all, so a
+        # substitutable one is not skipped quietly the way an absent one is.
+        add("dkms", "Kernel modules built for the new kernel", "fail",
+            "not established: %s" % trust_note("dkms"))
+        hard_fail = True
+    elif new_kernels and EXECUTOR.available("dkms"):
         for kver in new_kernels:
             rc, out, _ = run(["dkms", "status", "-k", kver], timeout=60)
             lines = [ln for ln in out.splitlines() if ln.strip()]
@@ -622,9 +1044,20 @@ def run_verify(txn):
 
     # (e) failed units, diffed against the pre-commit baseline: only NEW
     # failures count, so a unit the admin masked-broken long ago stays quiet
-    baseline = set(txn.get("baseline_failed", []))
-    new_failed = [u for u in failed_units() if u not in baseline]
-    if new_failed:
+    baseline = set(txn.get("baseline_failed") or [])
+    now_failed = failed_units()
+    if now_failed is None:
+        # A substitutable systemctl reporting an empty list would turn this
+        # into a silent pass on a machine the update just broke.
+        add("failed-units", "No newly failed services", "fail",
+            "not established: %s" % trust_note("systemctl"))
+        hard_fail = True
+        new_failed = []
+    else:
+        new_failed = [u for u in now_failed if u not in baseline]
+    if now_failed is None:
+        pass
+    elif new_failed:
         add("failed-units", "No newly failed services", "warn",
             "new failures: %s" % ", ".join(new_failed))
     else:
@@ -632,7 +1065,13 @@ def run_verify(txn):
             "systemctl --failed shows nothing new")
 
     # needrestart: kernel state + restart of non-session services
-    if shutil.which("needrestart"):
+    if is_substitutable("needrestart"):
+        # needrestart's output selects services this daemon then restarts
+        # AS ROOT. A substitutable one is a root-service-restart primitive,
+        # so it is refused rather than run.
+        add("needrestart", "Services on current libraries", "warn",
+            "not run: %s" % trust_note("needrestart"))
+    elif EXECUTOR.available("needrestart"):
         rc, out, _ = run(["needrestart", "-b"], timeout=120)
         ksta = 1
         svcs = []
@@ -666,15 +1105,22 @@ def run_verify(txn):
                 "pass", "; ".join(detail) or "nothing needs a restart")
 
     # (f) network still stands: default route + the mirror we just used
-    rc, out, _ = run(["ip", "route", "show", "default"], timeout=5)
-    if rc == 0 and out.strip():
+    rc, out, err = run(["ip", "route", "show", "default"], timeout=5)
+    if untrusted(rc):
+        add("route", "Default route present", "warn",
+            "not established: %s" % err)
+    elif rc == 0 and out.strip():
         add("route", "Default route present", "pass", out.strip().splitlines()[0])
     else:
         add("route", "Default route present", "warn", "no default route")
-    mirror = next(iter(txn.get("mirror_hosts", [])), None)
+    mirror = next((h for h in (mirror_hostname(v) for v in
+                               txn.get("mirror_hosts") or []) if h), None)
     if mirror:
-        rc, out, _ = run(["getent", "hosts", mirror], timeout=3)
-        if rc == 0 and out.strip():
+        rc, out, err = run(["getent", "hosts", mirror], timeout=3)
+        if untrusted(rc):
+            add("dns", "Mirror still resolves", "warn",
+                "not established: %s" % err)
+        elif rc == 0 and out.strip():
             add("dns", "Mirror still resolves", "pass", mirror)
         else:
             add("dns", "Mirror still resolves", "warn",
@@ -685,24 +1131,33 @@ def run_verify(txn):
     sessions = (glob.glob("/usr/share/wayland-sessions/*.desktop")
                 + glob.glob("/usr/share/xsessions/*.desktop"))
     missing_libs = []
-    for binary in GRAPHICS_BINARIES:
-        if os.path.exists(binary):
-            _, lout, _ = run(["ldd", binary], timeout=10)
-            for line in lout.splitlines():
-                if "not found" in line:
-                    missing_libs.append("%s: %s" % (os.path.basename(binary),
-                                                    line.strip()))
-    if rc == 0 and sessions and not missing_libs:
+    ldd_ok = EXECUTOR.available("ldd")
+    if ldd_ok:
+        for binary in GRAPHICS_BINARIES:
+            if os.path.exists(binary):
+                _, lout, _ = run(["ldd", binary], timeout=10)
+                for line in lout.splitlines():
+                    if "not found" in line:
+                        missing_libs.append(
+                            "%s: %s" % (os.path.basename(binary), line.strip()))
+    if rc == 0 and sessions and not missing_libs and ldd_ok:
         add("graphics", "Display manager and session files look intact",
             "pass", "sddm active, session files present, no missing "
                     "libraries - a graphical login is only proven by the "
                     "next boot")
     else:
         bits = []
-        if rc != 0:
+        if untrusted(rc):
+            # Say what actually happened. "sddm not active" would be a
+            # claim about the machine; this is a claim about the tool.
+            bits.append("sddm state not established: %s"
+                        % trust_note("systemctl"))
+        elif rc != 0:
             bits.append("sddm not active")
         if not sessions:
             bits.append("no session .desktop files")
+        if not ldd_ok:
+            bits.append("library scan not run: %s" % trust_note("ldd"))
         bits.extend(missing_libs[:5])
         add("graphics", "Display manager and session files look intact",
             "warn", "; ".join(bits) or "inconclusive")
@@ -733,6 +1188,12 @@ class Fireproof(dbus.service.Object):
         self._bus = bus
         self._loop = loop
         self._lock = threading.Lock()      # one operation at a time
+        self._verify_lock = threading.Lock()   # one verify battery at a time
+        self._last_verify = None           # last completed battery, for Inspect()
+        self._analyze_guard = threading.Lock()
+        self._analyze_running = False
+        self._analyze_waiters = []
+        self._analysis_at = 0.0            # monotonic stamp of self._analysis
         self._phase = "idle"
         self._state = load_state()
         self._analysis = None
@@ -844,16 +1305,45 @@ class Fireproof(dbus.service.Object):
     @dbus.service.method(IFACE, in_signature="", out_signature="s",
                          async_callbacks=("reply", "error"))
     def Analyze(self, reply, error):
+        """Side-effect free, but not free: build_analysis opens the apt
+        cache. The method is deliberately unauthenticated so the tray badge
+        works without a password, which means any local process can call it
+        in a loop. Previously each call spawned another cache-opening thread
+        inside a root daemon with no bound. Now a fresh result is served
+        from cache, and concurrent callers coalesce onto a single run."""
+        with self._analyze_guard:
+            fresh = (self._analysis is not None and
+                     time.monotonic() - self._analysis_at < ANALYZE_CACHE_SECONDS)
+            if fresh:
+                GLib.idle_add(reply, json.dumps(self._analysis))
+                return
+            self._analyze_waiters.append((reply, error))
+            if self._analyze_running:
+                return          # join the run already in flight
+            self._analyze_running = True
+
         def work():
             try:
                 analysis = build_analysis(self._state)
                 self._analysis = analysis
+                self._analysis_at = time.monotonic()
                 GLib.idle_add(self._notify_badge)
-                GLib.idle_add(reply, json.dumps(analysis))
+                self._drain_analyze(json.dumps(analysis), None)
             except Exception as e:  # cache open can fail on broken lists
                 log("analyze failed: %s" % e)
-                GLib.idle_add(error, AnalyzeFailedError(str(e)))
+                self._drain_analyze(None, AnalyzeFailedError(str(e)))
         threading.Thread(target=work, name="analyze", daemon=True).start()
+
+    def _drain_analyze(self, payload, failure):
+        """Answer every caller that coalesced onto the finished run."""
+        with self._analyze_guard:
+            waiters, self._analyze_waiters = self._analyze_waiters, []
+            self._analyze_running = False
+        for reply, error in waiters:
+            if failure is None:
+                GLib.idle_add(reply, payload)
+            else:
+                GLib.idle_add(error, failure)
 
     @dbus.service.method(IFACE, in_signature="", out_signature="s")
     def GetState(self):
@@ -865,11 +1355,7 @@ class Fireproof(dbus.service.Object):
         })
 
     def _read_pending(self):
-        try:
-            with open(PENDING_FILE) as f:
-                return json.load(f)
-        except (OSError, ValueError):
-            return None
+        return sfstate.read_pending()
 
     # -- commit protocol ---------------------------------------------------
 
@@ -915,6 +1401,8 @@ class Fireproof(dbus.service.Object):
 
     def _commit_worker(self, expected_hash):
         lock_fd = -1
+        committed = False
+        commit_ok = False
         result = {"ok": False, "stage": "start", "message": ""}
         txn = {
             "txn": str(uuid.uuid4()),
@@ -941,8 +1429,23 @@ class Fireproof(dbus.service.Object):
             # 2. re-validate under the lock: the archive may have moved
             self._set_phase("revalidating")
             cache = apt.Cache(apt.progress.base.OpProgress())
-            cache.upgrade(dist_upgrade=True)
+            # ...and dpkg must not be mid-way through an earlier run. Analyze
+            # already refuses to offer an update then; this is the same rule
+            # where it cannot be raced or skipped by a client.
+            interrupted = interrupted_report(cache)
+            if interrupted is not None:
+                os.close(lock_fd)
+                lock_fd = -1
+                result = {"ok": False, "stage": "interrupted",
+                          "message": interrupted["message"],
+                          "repair_command": REPAIR_COMMAND}
+                return
+            # The same plan analyze showed: refused removals held back.
+            plan_update(cache)
             changes = cache.get_changes()
+            if refused_removals(changes):
+                raise RuntimeError("the update plan removes a package "
+                                   "Fireproof never removes")
             live_hash = change_set_hash(changes)
             if live_hash != expected_hash:
                 os.close(lock_fd)
@@ -997,7 +1500,13 @@ class Fireproof(dbus.service.Object):
                 if os.path.exists(fname):
                     debs.append(fname)
             news_text = ""
-            if debs and shutil.which("apt-listchanges"):
+            if debs and is_substitutable("apt-listchanges"):
+                # The NEWS text is what a human approves at the gate. A
+                # substitutable apt-listchanges could show benign NEWS for
+                # a disruptive update, so it is not run; the gate then has
+                # nothing to show, which is the same as it being absent.
+                log("NEWS skipped: %s" % trust_note("apt-listchanges"))
+            elif debs and EXECUTOR.available("apt-listchanges"):
                 rc, out, _ = run(["apt-listchanges", "--which=news",
                                   "-f", "text"] + debs, timeout=120)
                 if rc == 0:
@@ -1020,6 +1529,7 @@ class Fireproof(dbus.service.Object):
             #    80snapper + 79phoenix-space wrap the dpkg calls in Phoenix
             #    Points automatically - Fireproof adds ZERO snapshots.
             self._set_phase("committing")
+            committed = True
             os.environ["DEBIAN_FRONTEND"] = "noninteractive"
             apt_pkg.config.set("DPkg::Options::", "--force-confold")
             try:
@@ -1039,7 +1549,6 @@ class Fireproof(dbus.service.Object):
             pre_point = snapper_first_pre_after(pre_max)
             txn["pre_point"] = pre_point
             if pre_point is not None:
-                kernnote = ""
                 if txn["kernels"]:
                     kernnote = " (kernel %s -> %s, %d pkgs)" % (
                         os.uname().release,
@@ -1047,20 +1556,14 @@ class Fireproof(dbus.service.Object):
                         len(changes))
                 else:
                     kernnote = " (%d pkgs)" % len(changes)
-                run(["snapper", "-c", "root", "modify",
-                     "-d", "Fireproof: before update %s%s"
-                           % (datetime.now().strftime("%Y-%m-%d %H:%M"),
-                              kernnote),
-                     "-u", "fireproof=pre,txn=%s" % txn["txn"],
-                     str(pre_point)], timeout=20)
+                sfsnap.label_point(
+                    pre_point,
+                    "Fireproof: before update %s%s"
+                    % (datetime.now().strftime("%Y-%m-%d %H:%M"), kernnote),
+                    txn["txn"])
 
             # 8. pending flag BEFORE any reboot offer reaches the user
-            atomic_write(PENDING_FILE, json.dumps({
-                "txn": txn["txn"],
-                "pre_point": pre_point,
-                "written": now_iso(),
-                "kernels": txn["kernels"],
-            }) + "\n")
+            sfstate.write_pending(txn["txn"], pre_point, txn["kernels"])
 
             # 9. verify battery
             self._set_phase("verifying")
@@ -1106,49 +1609,82 @@ class Fireproof(dbus.service.Object):
             GLib.idle_add(self.Finished, json.dumps(result))
             self._lock.release()
             if self._quit_requested:
-                log("deferred stop: commit finished cleanly, exiting now")
-                GLib.idle_add(self._loop.quit)
+                log("deferred stop: commit finished, exiting now")
+                GLib.idle_add(self._exit_after, "deferred stop")
+            elif committed and commit_ok:
+                # This process is still the code and libraries it started
+                # with; dpkg may just have replaced them (this package, python3,
+                # python3-apt). Nothing restarts fireproofd from inside its own
+                # transaction any more -- not this package's scripts, not
+                # needrestart -- so it leaves now, after Finished, and the next
+                # D-Bus call activates whatever is on disk. A failed commit
+                # keeps the daemon up: on a half-configured system the running
+                # process is what can still tell the user how to repair it.
+                log("update committed: exiting so the next activation runs "
+                    "the code now on disk")
+                GLib.idle_add(self._exit_after, "post-commit")
+
+    def _exit_after(self, why):
+        """Quit the main loop once queued signals have left the process."""
+        try:
+            self._bus.flush()
+        except Exception as e:  # never let a flush failure keep us running
+            log("%s: bus flush failed: %s" % (why, e))
+        self._loop.quit()
+        return False
 
     def _record_failed_set(self, cs_hash, reason):
-        sets = [s for s in self._state.get("failed_sets", [])
-                if s.get("hash") != cs_hash]
-        sets.append({"hash": cs_hash, "date": now_iso(), "reason": reason})
-        self._state["failed_sets"] = sets[-16:]   # bounded history
+        sfstate.record_failed_set(self._state, cs_hash, reason)
 
     # -- verify + rollback bookkeeping ------------------------------------
 
     @dbus.service.method(IFACE, in_signature="", out_signature="s",
-                         async_callbacks=("reply", "error"))
-    def Verify(self, reply, error):
+                         async_callbacks=("reply", "error"),
+                         sender_keyword="sender")
+    def Verify(self, reply, error, sender=None):
+        """Run the post-update verify battery.
+
+        Polkit-gated. The battery executes `dpkg --audit` and
+        `apt-get -s -f install` as root on demand, so while it mutates
+        nothing it is unbounded root work that any local process could
+        previously drive on the system bus, and it hands the caller a
+        detailed report of the machine's package state. Inspect() returns
+        the last recorded result and executes nothing."""
+        try:
+            self._require_auth(sender)
+        except NotAuthorizedError as e:
+            error(e)
+            return
+        if not self._verify_lock.acquire(blocking=False):
+            error(BusyError("a verify battery is already running"))
+            return
         txn = self._state.get("last_txn") or {}
         def work():
             try:
-                GLib.idle_add(reply, json.dumps(run_verify(txn)))
+                result = run_verify(txn)
+                self._last_verify = {"recorded": now_iso(), "result": result}
+                GLib.idle_add(reply, json.dumps(result))
             except Exception as e:
                 GLib.idle_add(error, VerifyFailedError(str(e)))
+            finally:
+                self._verify_lock.release()
         threading.Thread(target=work, name="verify", daemon=True).start()
+
+    @dbus.service.method(IFACE, in_signature="", out_signature="s")
+    def Inspect(self):
+        """The last recorded verify battery, or null. Executes nothing, so
+        it needs no authorization -- this is the unprivileged read path
+        that Verify used to provide by accident."""
+        return json.dumps(self._last_verify)
 
     @dbus.service.method(IFACE, in_signature="", out_signature="s")
     def RollbackTarget(self):
         """The Point the one rollback button restores: recorded pre-Point of
         the last transaction. The restore itself is pkexec phoenix-restore -
         Fireproof never re-implements it."""
-        last = self._state.get("last_txn")
-        pending = self._read_pending()
-        point = None
-        source = None
-        if pending and pending.get("pre_point") is not None:
-            point, source = pending["pre_point"], "pending"
-        elif last and last.get("pre_point") is not None:
-            point, source = last["pre_point"], "state"
-        return json.dumps({
-            "point": point,
-            "source": source,
-            "txn": (last or {}).get("txn"),
-            "command": ("pkexec /usr/libexec/phoenix-restore %s" % point
-                        if point is not None else None),
-            "phoenix_available": phoenix_available(),
-        })
+        target = sfstate.rollback_target(self._state, self._read_pending())
+        target["phoenix_available"] = phoenix_available()
+        return json.dumps(target)
 
     @dbus.service.method(IFACE, in_signature="s", out_signature="b",
                          sender_keyword="sender")
@@ -1214,6 +1750,14 @@ def main():
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, on_stop_signal)
+
+    # Operability: record, once, at start, what this daemon considers
+    # trusted. When a verify battery later says "not established", the
+    # journal already says which program was refused and why, and an
+    # operator can tell an ABSENT optional tool from a SUBSTITUTABLE one
+    # without guessing.
+    for _name in sorted(SECURITY_CRITICAL):
+        log("trust: %s" % EXECUTOR.explain(_name))
 
     # systemd readiness (Type=dbus keys on the bus name, but be explicit
     # in the journal for the QEMU harness)

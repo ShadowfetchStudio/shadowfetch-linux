@@ -3,7 +3,7 @@
 shadowfetch-welcome - first-boot welcome & setup for Shadowfetch Linux (Umbra).
 
 A small, focused PyQt6 wizard that:
-  - Opens with Ignition Setup: pick your flame (Core / Creator / Developer /
+  - Opens with Ignition Setup: choose your setup (Core / Creator / Developer /
     AI Workstation / Full Flame) - mandatory first page until a choice is
     stamped, with honest measured sizes, an "already on your system" strip,
     an offline save-your-choice path, and automatic Phoenix Point protection
@@ -11,19 +11,19 @@ A small, focused PyQt6 wizard that:
   - Welcomes the user to Shadowfetch Linux
   - Opens Shadowfetch Guide for a private pre-install System Passport
   - Lets them choose a role-based setup profile to preselect useful apps
-  - Lets them pick a signature accent colour (applied to KDE Plasma 6)
   - Offers a curated set of optional apps to install from Flathub
-  - Offers Buzz; Buzz ranks and downloads open models in its Compute settings
-  - Offers verified, user-level installs of Codex, Claude Code, Grok Build,
-    and Cursor Agent
-  - Offers the one-click software catalog (media apps, presets, local AI)
+  - Sets the agent network (online or offline) and offers exactly three
+    optional agents: Grok Bot, Hermes and OpenClaw
+  - Ends by handing the person to ShadowCode to connect their subscriptions,
+    API keys and local models
+  - Offers the one-click software catalog (media apps, presets)
 
-Honest, fast, private, AI-ready - built on Debian + KDE Plasma 6.
-Everything here is reliable on Plasma 6; nothing is left half-working.
-Zero telemetry: the only network activity is apt talking to the pinned
-mirrors and downloads the user starts by clicking a card.
+Built on Debian + KDE Plasma 6. Optional application installs are selected
+during setup. Vendor applications retain their own onboarding downloads,
+network behavior and account requirements.
 """
 
+import importlib.util
 import json
 import os
 import re
@@ -64,9 +64,10 @@ if __name__ == "__main__" and {"-h", "--help", "--version"}.intersection(sys.arg
             "A graphical wizard that runs on login. Until a bundle choice is made it\n"
             "opens on the Ignition Setup page (Core / Creator / Developer / AI\n"
             "Workstation / Full Flame); afterwards it runs the one-time welcome flow\n"
-            "(profile, graphics, desktop, apps, optional Buzz and coding agents)\n"
+            "(profile, graphics, desktop, apps, Grok Bot and coding agents)\n"
             "and then\n"
-            "exits silently on later logins. Every download remains opt-in.\n"
+            "exits silently on later logins. Optional application installs are\n"
+            "selected during setup; vendor onboarding may download other assets.\n"
             "\n"
             "Options:\n"
             "  --force            Run the welcome flow again even though setup has\n"
@@ -88,12 +89,71 @@ if __name__ == "__main__" and {"-h", "--help", "--version"}.intersection(sys.arg
         )
     raise SystemExit(0)
 
+
+def _load_desktop():
+    """The one shared desktop library (W-30).
+
+    The bundle catalog, the hwscan freshness rule, the five helper paths and
+    the privileged install argv were implemented twice - once in this file and
+    once in the Control Center - in two divergent shapes, and
+    tools/drift_gate.py reported the pair as BLOCKED [desktop-helpers]. They
+    are now one module, /usr/lib/shadowfetch/desktop/sf_desktop.py, shipped by
+    shadowfetch-defaults and imported by both front-ends. This package Depends
+    on it, so the module is present on any installed system; the sibling
+    source tree satisfies it in a checkout.
+
+    Deliberately BELOW the --help/--version block, because asking this program
+    what it is has to keep working on a half-installed machine, and
+    deliberately ABOVE everything else, because a missing shared library is a
+    broken installation and must say so rather than quietly degrade into a
+    wizard with an empty catalog.
+    """
+    locations = [Path("/usr/lib/shadowfetch/desktop")]
+    locations += [
+        parent / "packages/shadowfetch-defaults/data/usr/lib/shadowfetch/desktop"
+        for parent in Path(__file__).resolve().parents]
+    for location in locations:
+        path = location / "sf_desktop.py"
+        if path.is_file():
+            # EXECUTE THE FILE THAT WAS JUST CHECKED. `import sf_desktop`
+            # consults sys.modules BEFORE sys.path, so a module already
+            # registered under that name is handed back and this existence
+            # check decides nothing. Measured against the Control Center's
+            # identical loader before it was fixed: a planted module was
+            # accepted, PKEXEC came back as the bare word "pkexec", and the
+            # install argv was $PATH-resolved again -- the same shape as the
+            # PATH-shadowing hole this codebase was bitten by in Phase 3.1.
+            # spec_from_file_location never consults sys.modules.
+            cached = sys.modules.get("sf_desktop")
+            if cached is not None and getattr(cached, "__file__", None) == str(path):
+                return cached
+            spec = importlib.util.spec_from_file_location("sf_desktop", path)
+            module = importlib.util.module_from_spec(spec)
+            # Registered BEFORE exec so nothing runs twice and no second module
+            # object appears; popped if exec raises, so a failed load cannot
+            # leave a half-built module behind for the next caller.
+            sys.modules["sf_desktop"] = module
+            try:
+                spec.loader.exec_module(module)
+            except BaseException:
+                sys.modules.pop("sf_desktop", None)
+                raise
+            return module
+    raise ImportError(
+        "sf_desktop.py was not found. shadowfetch-welcome requires the "
+        "matching shadowfetch-defaults package, which ships the shared desktop "
+        "library at /usr/lib/shadowfetch/desktop; repair the installation.")
+
+
+desktop = _load_desktop()
+
 from PyQt6.QtCore import Qt, QSize, QTimer, QObject, pyqtSignal, pyqtSlot, QThread
 from PyQt6.QtGui import QFont, QIcon
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QStackedWidget, QCheckBox, QProgressBar,
-    QFrame, QScrollArea, QRadioButton, QButtonGroup, QDialog, QMessageBox,
+    QFrame, QScrollArea, QRadioButton, QButtonGroup, QDialog, QInputDialog,
+    QMessageBox, QLayout,
 )
 
 try:
@@ -102,100 +162,79 @@ try:
 except Exception:  # noqa: BLE001 - QtDBus genuinely optional at runtime
     QT_DBUS = False
 
-# ---- Fire and Ice (3.1) --------------------------------------------------
-# The element is decided before this window exists: at the boot menu
-# (sf.element= on the kernel command line -> /etc/shadowfetch/element), or by
-# the user afterwards (~/.config/shadowfetch/element, or the Element page in
-# this very wizard). Everything downstream — palette, profile order, agent
-# network defaults — reads ONE value so the system never looks half-switched.
-def load_element() -> str:
-    v = os.environ.get("SHADOWFETCH_ELEMENT", "").strip().lower()
-    for candidate in (
-        Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
-        / "shadowfetch" / "element",
-        Path("/etc/shadowfetch/element"),
-    ):
-        if v:
-            break
-        try:
-            v = candidate.read_text().strip().lower()
-        except OSError:
-            continue
-    return v if v in ("fire", "ice") else "fire"
-
-
-ELEMENT = load_element()
-
-# ---- Umbra palette (element-aware) ---------------------------------------
-# Ice mirrors Fire: #D8A24A gold reflects to #4AA2D8 azure (a literal R/B
-# swap). Neutrals stay graphite in both; GREEN/RED keep their meanings.
-_PALETTES = {
-    "fire": dict(GOLD="#D8A24A", GOLD_HOVER="#E8B65E", GOLD_PRESS="#C28E38",
-                 BG="#0B0E12", CARD="#141922", CARD_HOVER="#1B212C",
-                 BORDER="#2C333B", INK="#0B0E12"),
-    "ice":  dict(GOLD="#4AA2D8", GOLD_HOVER="#5EB9E8", GOLD_PRESS="#3887C2",
-                 BG="#0A0F16", CARD="#121A26", CARD_HOVER="#182233",
-                 BORDER="#2C3947", INK="#0A0F16"),
-}
-_P = _PALETTES[ELEMENT]
-GOLD       = _P["GOLD"]       # primary accent (gold in Fire, azure in Ice)
-GOLD_HOVER = _P["GOLD_HOVER"]
-GOLD_PRESS = _P["GOLD_PRESS"]
-BG         = _P["BG"]
-CARD       = _P["CARD"]
-CARD_HOVER = _P["CARD_HOVER"]
-BORDER     = _P["BORDER"]
+# ---- ShadowCode palette ----------------------------------------------------
+# One look since 5.0: gold and brushed steel on black. The agent network
+# setting that replaced Fire/Ice's security half is read through the shared
+# desktop library at the moment it matters, never cached at import.
+GOLD       = "#F2B33D"    # primary accent
+GOLD_HOVER = "#FFC95E"
+GOLD_PRESS = "#B97E22"
+SILVER     = "#BCC0C6"    # brushed-steel secondary accent
+BG         = "#0B0E12"
+CARD       = "#141922"
+CARD_HOVER = "#1B212C"
+BORDER     = "#2C333B"
 TEXT       = "#E6E9ED"
 MUTED      = "#9AA3AD"
-INK        = _P["INK"]        # dark text on the accent
+INK        = "#0B0E12"    # dark text on the accent
 GREEN      = "#7FB069"
 RED        = "#E2533B"
 
 
+def _check_mark() -> str:
+    """The tick image for checked checkboxes, as a stylesheet url path.
+
+    A Qt stylesheet that styles QCheckBox::indicator drops the native tick, so
+    a checked box was a plain gold square (5.0.0 QA). The SVG ships with this
+    package; a checkout falls back to the file beside src/.
+    """
+    for candidate in (Path("/usr/share/shadowfetch/welcome/check.svg"),
+                      Path(__file__).resolve().parent.parent
+                      / "data/usr/share/shadowfetch/welcome/check.svg"):
+        if candidate.is_file():
+            return candidate.as_posix()
+    return ""
+
+
+CHECK_MARK = _check_mark()
+
+
+# The optional agents Welcome offers, and only these. Coding tools reached
+# through a subscription (Codex, Claude Code, Cursor, Grok) are connected in
+# ShadowCode on the last page instead.
 CODING_AGENTS = (
     {
-        "key": "codex",
-        "name": "Codex",
-        "label": "OpenAI Codex CLI",
-        "description": "Verified user-level install. Sign in with ChatGPT after setup.",
-        "helper": "shadowfetch-codex",
+        "key": "grok-bot",
+        "name": "Grok Bot",
+        "label": "Grok Bot · official native desktop",
+        "description": "Cloud teammates. Eligible account and plan required; sign in in the native app.",
+        "helper": "shadowfetch-grok-bot",
         "helper_tool": None,
-        "install_title": "Installing Codex CLI...",
-        "checking": "Checking the OpenAI release pin and installer...",
-        "receipt": "Codex CLI 0.150.1 passed its pinned installer and version checks.",
+        "install_title": "Installing official Grok Bot...",
+        "checking": "Verifying the pinned native package before administrator approval...",
+        "receipt": "The official Grok Bot desktop passed its pinned package and version checks. Sign in in the native app.",
     },
     {
-        "key": "claude",
-        "name": "Claude Code",
-        "label": "Anthropic Claude Code",
-        "description": "Verified user-level install. Sign in with Claude after setup.",
-        "helper": "shadowfetch-code-agent",
-        "helper_tool": "claude",
-        "install_title": "Installing Claude Code...",
-        "checking": "Checking Anthropic's pinned Linux release...",
-        "receipt": "Claude Code 2.1.227 passed its artifact and version checks.",
+        "key": "hermes",
+        "name": "Hermes",
+        "label": "Hermes Agent · Nous Research",
+        "description": "Open-source agent installed in your home at a verified release. Your own provider key required.",
+        "helper": "shadowfetch-hermes",
+        "helper_tool": None,
+        "install_title": "Installing Hermes Agent...",
+        "checking": "Checking the pinned Hermes release and installer...",
+        "receipt": "Hermes Agent passed its pinned installer and commit checks.",
     },
     {
-        "key": "grok",
-        "name": "Grok Build",
-        "label": "xAI Grok Build",
-        "description": "Verified user-level install. Sign in with xAI after setup.",
-        "helper": "shadowfetch-code-agent",
-        "helper_tool": "grok",
-        "install_title": "Installing Grok Build...",
-        "checking": "Checking xAI's pinned Grok CLI release...",
-        "receipt": "Grok Build CLI 1.0.5 passed its artifact and version checks.",
-    },
-    {
-        "key": "cursor",
-        "name": "Cursor Agent",
-        "label": "Cursor Agent",
-        "description": "Verified user-level install. Sign in with Cursor after setup.",
-        "helper": "shadowfetch-code-agent",
-        "helper_tool": "cursor",
-        "install_title": "Installing Cursor Agent...",
-        "checking": "Checking Cursor's pinned Linux release...",
-        "receipt": "Cursor Agent 2026.08.11-e8db854 passed its archive and version checks.",
+        "key": "openclaw",
+        "name": "OpenClaw",
+        "label": "OpenClaw · personal AI agent",
+        "description": "Sandboxed, loopback-only. Long security-advisory record: keep it updated. Your own provider key required.",
+        "helper": "shadowfetch-openclaw",
+        "helper_tool": None,
+        "install_title": "Installing OpenClaw...",
+        "checking": "Checking the pinned OpenClaw package and its lockfile...",
+        "receipt": "OpenClaw passed its pinned package, integrity and signature checks.",
     },
 )
 CODING_AGENT_BY_KEY = {agent["key"]: agent for agent in CODING_AGENTS}
@@ -249,6 +288,17 @@ def open_system_guide():
     return False
 
 
+def open_control_page(page):
+    control = shutil.which("shadowfetch-control")
+    if not control:
+        return False
+    try:
+        subprocess.Popen([control, "--page", page])
+        return True
+    except OSError:
+        return False
+
+
 def open_workbench():
     """Open the flagship production workspace surface."""
     control = shutil.which("shadowfetch-control")
@@ -259,6 +309,16 @@ def open_workbench():
         return True
     except OSError:
         return False
+
+
+def open_shadowcode():
+    """Open ShadowCode, where the person connects subscriptions, API keys and models.
+
+    The binary is resolved from the trusted table, but the session PATH is kept:
+    ShadowCode runs the person's own vendor CLIs from ~/.local/bin, which
+    desktop.trusted_env() deliberately leaves out.
+    """
+    return desktop.start_with_session_path("shadowcode")
 
 CONFIG_DIR = Path.home() / ".config" / "shadowfetch"
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -271,46 +331,22 @@ STATE_DIR = Path("/var/lib/shadowfetch")
 IGNITION_DONE = STATE_DIR / "ignition-done"
 IGNITION_CHOICE = STATE_DIR / "ignition-choice.json"
 IGNITION_SKIP = CONFIG_DIR / "ignition-skip"
-CATALOG_DIR = Path("/usr/share/shadowfetch/welcome/catalog")
 SIZES_JSON = Path("/usr/share/shadowfetch/welcome/sizes.json")
-BUNDLE_HELPER = "/usr/libexec/shadowfetch-bundle-install"
+# STATE_HELPER is this package's own /usr/libexec payload and stays spelled
+# out here. The five paths that used to sit beside it did not belong here: the
+# catalog directory, the bundle installer, the hwscan CLI, the hwscan fact
+# file and phoenix-restore were each written out a second time in this file,
+# and the Control Center held its own copy of all five. They now come from the
+# shared library - desktop.CATALOG_DIR, desktop.BUNDLE_INSTALL,
+# desktop.HWSCAN_CLI, desktop.HWSCAN_JSON, desktop.PHOENIX_RESTORE - which is
+# the module the Control Center reads them from too. One spelling each.
 STATE_HELPER = "/usr/libexec/shadowfetch-ignition-state"
-PHOENIX_RESTORE = "/usr/libexec/phoenix-restore"
-HWSCAN_CLI = "/usr/libexec/shadowfetch-hwscan"
-HWSCAN_JSON = STATE_DIR / "hwscan.json"
 
 IGNITION_ORDER = [
     "ignition-core", "ignition-creator", "ignition-developer",
     "ignition-ai", "ignition-full-flame",
 ]
 
-
-def _rgb(hex_colour: str) -> str:
-    """'#D8A24A' -> '216,162,74' for Plasma's kdeglobals AccentColor."""
-    h = hex_colour.lstrip("#")
-    return f"{int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)}"
-
-
-# name -> hex; the element's signature colour leads, because the wizard
-# preselects ACCENTS[0].
-if ELEMENT == "ice":
-    ACCENTS = [
-        ("Glacier Azure", "#4AA2D8"),
-        ("Signal Cyan",   "#29B6F6"),
-        ("Umbra Gold",    "#D8A24A"),
-        ("Crimson",       "#E2533B"),
-        ("Verdant",       "#7FB069"),
-        ("Violet",        "#9B7EDE"),
-    ]
-else:
-    ACCENTS = [
-        ("Umbra Gold",    "#D8A24A"),
-        ("Eclipse Amber", "#E8B65E"),
-        ("Signal Cyan",   "#29B6F6"),
-        ("Crimson",       "#E2533B"),
-        ("Verdant",       "#7FB069"),
-        ("Violet",        "#9B7EDE"),
-    ]
 
 # (flatpak id, name, description) - installed from Flathub on request
 APPS = [
@@ -372,8 +408,8 @@ APPS = [
     ("cc.arduino.IDE2",        "Arduino IDE",    "Program and flash Arduino microcontrollers"),
 ]
 
-def build_profile_presets(element: str) -> list:
-    """The setup profiles, branched by element.
+def build_profile_presets() -> list:
+    """The setup profiles.
 
     PLAIN-LANGUAGE RULE: every profile description ends with one explicit
     sentence saying exactly which AI tools it installs or preselects — the
@@ -389,7 +425,7 @@ def build_profile_presets(element: str) -> list:
             "com.rawtherapee.RawTherapee", "fr.handbrake.ghb", "net.scribus.Scribus",
             "org.kde.digikam", "com.dec05eba.gpu_screen_recorder", "io.github.seadve.Kooha",
         ],
-        "ai_choice": None, "agents": [],
+        "agents": [],
     }
     gaming = {
         "key": "gaming",
@@ -400,11 +436,11 @@ def build_profile_presets(element: str) -> list:
             "com.valvesoftware.Steam", "com.heroicgameslauncher.hgl",
             "net.lutris.Lutris", "net.davidotek.pupgui2",
         ],
-        "ai_choice": None, "agents": [],
+        "agents": [],
     }
     office = {
         "key": "office",
-        "title": "Office and communication" if element == "fire" else "Quiet office",
+        "title": "Office and communication",
         "desc": "Office suites, email, notes, password management and private messaging. "
                 "AI: installs no AI tools.",
         "apps": [
@@ -412,7 +448,7 @@ def build_profile_presets(element: str) -> list:
             "org.mozilla.Thunderbird", "md.obsidian.Obsidian", "net.cozic.joplin_desktop",
             "com.bitwarden.desktop", "org.signal.Signal", "im.riot.Riot",
         ],
-        "ai_choice": None, "agents": [],
+        "agents": [],
     }
     maker = {
         "key": "maker",
@@ -423,59 +459,32 @@ def build_profile_presets(element: str) -> list:
             "io.github.softfever.OrcaSlicer", "com.prusa3d.PrusaSlicer",
             "org.freecad.FreeCAD", "org.kicad.KiCad", "cc.arduino.IDE2",
         ],
-        "ai_choice": None, "agents": [],
+        "agents": [],
     }
-    if element == "ice":
-        developer = {
-            "key": "developer",
-            "title": "Cold-room developer",
-            "desc": "Editors, database tools, API tooling and a fast terminal. "
-                    "AI: preselects the Claude Code and Codex CLI coding agents; in Ice, "
-                    "Firebreak agent sandboxes start with NO network — you grant it per "
-                    "session. You confirm everything on the AI workspace screen.",
-            "apps": [
-                "com.vscodium.codium", "dev.zed.Zed", "io.dbeaver.DBeaverCommunity",
-                "io.beekeeperstudio.Studio", "com.usebruno.Bruno", "com.mitchellh.ghostty",
-            ],
-            "ai_choice": None, "agents": ["claude", "codex"],
-        }
-        local_ai = {
-            "key": "local-ai",
-            "title": "Glacier AI lab",
-            "desc": "Fully local AI on this hardware. "
-                    "AI: installs Buzz and lets it rank and download an open model; "
-                    "preselects NO cloud coding agents — nothing leaves this machine.",
-            "apps": [],
-            "ai_choice": "install-buzz", "agents": [],
-        }
-        return [developer, office, local_ai, creative, gaming, maker]
     developer = {
         "key": "developer",
-        "title": "Forge developer",
+        "title": "Developer",
         "desc": "Editors, database tools, API tooling and a fast terminal. "
-                "AI: preselects the Claude Code and Codex CLI coding agents; in Fire, "
-                "Firebreak agent sandboxes may use the network by default (run hot). "
-                "You confirm everything on the AI workspace screen.",
+                "AI: ShadowCode is already installed and connects the coding tools and "
+                "models you already use; no optional agent is preselected.",
         "apps": [
             "com.vscodium.codium", "dev.zed.Zed", "io.dbeaver.DBeaverCommunity",
             "io.beekeeperstudio.Studio", "com.usebruno.Bruno", "com.mitchellh.ghostty",
         ],
-        "ai_choice": None, "agents": ["claude", "codex"],
+        "agents": [],
     }
-    local_ai = {
-        "key": "local-ai",
-        "title": "Local AI lab",
-        "desc": "The full local stack, run hot. "
-                "AI: installs Buzz (open models on this hardware) and preselects all "
-                "four coding agents — Codex CLI, Claude Code, Grok Build and Cursor. "
-                "You confirm everything on the AI workspace screen.",
+    agent_selection = {
+        "key": "agent-workspace",
+        "title": "Agent workspace",
+        "desc": "Preselects all three optional agents: Grok Bot, Hermes and OpenClaw. "
+                "You confirm everything on the agent setup screen.",
         "apps": [],
-        "ai_choice": "install-buzz", "agents": ["codex", "claude", "grok", "cursor"],
+        "agents": ["grok-bot", "hermes", "openclaw"],
     }
-    return [creative, gaming, developer, local_ai, office, maker]
+    return [developer, agent_selection, creative, gaming, office, maker]
 
 
-PROFILE_PRESETS = build_profile_presets(ELEMENT)
+PROFILE_PRESETS = build_profile_presets()
 
 PROFILE_BY_KEY = {p["key"]: p for p in PROFILE_PRESETS}
 
@@ -508,20 +517,6 @@ def fmt_mb(size_bytes) -> str:
     if mb >= 10:
         return f"{mb:.0f} MB"
     return f"{mb:.1f} MB"
-
-
-def load_catalog() -> dict:
-    """id -> record for every readable catalog JSON. Never raises."""
-    entries = {}
-    if CATALOG_DIR.is_dir():
-        for p in sorted(CATALOG_DIR.glob("*.json")):
-            try:
-                rec = json.loads(p.read_text(encoding="utf-8"))
-            except Exception:  # noqa: BLE001 - a broken record hides itself
-                continue
-            if isinstance(rec, dict) and rec.get("id") and rec.get("kind"):
-                entries[rec["id"]] = rec
-    return entries
 
 
 def load_sizes() -> dict:
@@ -557,22 +552,19 @@ def bundle_size_line(rec: dict, sizes: dict) -> str:
 
 
 def dpkg_installed(pkgs) -> set:
-    """Which of pkgs are installed right now (unprivileged dpkg-query)."""
+    """Which of pkgs are installed right now, as a set of names.
+
+    One dpkg-query for the whole desktop, in the shared library, and the shape
+    the three call sites here already want. This used to be a second
+    implementation that ran dpkg-query as a bare name - the session's PATH
+    choosing the program whose output becomes "Already on your system (3 of
+    7)", a sentence the reader takes as a fact about their machine. The
+    library names it /usr/bin/dpkg-query and pins the child's PATH.
+    """
     if not pkgs:
         return set()
-    try:
-        r = subprocess.run(
-            ["dpkg-query", "-W", "-f", "${Package} ${db:Status-Status}\n"] + list(pkgs),
-            capture_output=True, text=True, timeout=10,
-        )
-    except Exception:  # noqa: BLE001
-        return set()
-    found = set()
-    for line in r.stdout.splitlines():
-        parts = line.split()
-        if len(parts) == 2 and parts[1] == "installed":
-            found.add(parts[0])
-    return found
+    return {name for name, present in desktop.installed_map(list(pkgs)).items()
+            if present}
 
 
 def root_is_btrfs() -> bool:
@@ -600,14 +592,6 @@ def load_pending():
     return None
 
 
-def hwscan_cached() -> dict:
-    try:
-        data = json.loads(HWSCAN_JSON.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:  # noqa: BLE001
-        return {}
-
-
 def hwscan_has_nvidia(scan: dict) -> bool:
     for gpu in scan.get("gpus") or []:
         if isinstance(gpu, dict) and str(gpu.get("vendor", "")).lower() == "nvidia":
@@ -618,14 +602,21 @@ def hwscan_has_nvidia(scan: dict) -> bool:
 class CommandWorker(QThread):
     """Run cancellable argv commands off the UI thread."""
     progress = pyqtSignal(str)
-    finished = pyqtSignal(int)
+    completed = pyqtSignal(int)
 
     def __init__(self, commands):
         super().__init__()
         self.commands = commands
         self.process = None
+        self.returncode = 1
+        self.finished.connect(self._publish_result)
         self.cancel_requested = False
         self.cancel_escalation_started = False
+
+    @pyqtSlot()
+    def _publish_result(self):
+        # QThread.finished runs after run() returns; advancing setup is now safe.
+        self.completed.emit(self.returncode)
 
     def cancel(self):
         self.cancel_requested = True
@@ -693,20 +684,27 @@ class CommandWorker(QThread):
                 self.progress.emit(f"  ! {e}")
             finally:
                 self.process = None
-        self.finished.emit(rc)
+        self.returncode = rc
 
 
 class StreamingCommandWorker(QThread):
     """Run one long command and stream its combined output to the UI."""
     progress = pyqtSignal(str)
-    finished = pyqtSignal(int)
+    completed = pyqtSignal(int)
 
     def __init__(self, command):
         super().__init__()
         self.command = command
         self.process = None
+        self.returncode = 1
+        self.finished.connect(self._publish_result)
         self.cancel_requested = False
         self.cancel_escalation_started = False
+
+    @pyqtSlot()
+    def _publish_result(self):
+        # QThread.finished runs after run() returns; advancing setup is now safe.
+        self.completed.emit(self.returncode)
 
     def cancel(self):
         self.cancel_requested = True
@@ -754,7 +752,7 @@ class StreamingCommandWorker(QThread):
                 self._begin_cancel(process)
         except OSError as error:
             self.progress.emit(f"Could not start setup: {error}")
-            self.finished.emit(1)
+            self.returncode = 1
             return
         assert process.stdout is not None
         for line in iter(process.stdout.readline, ""):
@@ -764,7 +762,7 @@ class StreamingCommandWorker(QThread):
         process.stdout.close()
         code = process.wait()
         self.process = None
-        self.finished.emit(130 if self.cancel_requested else code)
+        self.returncode = 130 if self.cancel_requested else code
 
 
 class Card(QFrame):
@@ -841,10 +839,6 @@ class NMWatcher(QObject):
     def _poll(self):
         self._set(self._probe())
 
-    def _set(self, online: bool):
-        if online != self._online:
-            self._online = online
-            self.changed.emit(online)
 
     @staticmethod
     def _probe() -> bool:
@@ -875,34 +869,27 @@ class NMWatcher(QObject):
         self._online = online
         return online
 
+    def _set(self, online: bool):
+        if online != self._online:
+            self._online = online
+            self.changed.emit(online)
+
+
 
 class HwscanWorker(QThread):
-    """Fetch the hardware scan without ever blocking the choice screen.
+    """Keep the shared hardware scan off the choice screen's thread.
 
-    Reads /var/lib/shadowfetch/hwscan.json when it is from the current
-    boot, otherwise execs the CLI with a hard timeout. Emits {} on any
-    failure - the AI card then shows its honest 'scan unavailable' line.
+    The freshness rule - the fact file counts only if it was written after
+    this boot, otherwise run the unprivileged CLI - was written out twice,
+    once here against /proc/uptime and once in the Control Center. It is one
+    function now, desktop.load_hwscan(); this class is only the thread that
+    keeps it off the UI. Emits {} on any failure, and the AI card then shows
+    its honest 'scan unavailable' line.
     """
     got = pyqtSignal(dict)
 
     def run(self):
-        data = {}
-        try:
-            if HWSCAN_JSON.is_file():
-                with open("/proc/uptime", "r", encoding="utf-8") as fh:
-                    boot_time = time.time() - float(fh.read().split()[0])
-                if HWSCAN_JSON.stat().st_mtime >= boot_time:
-                    data = json.loads(HWSCAN_JSON.read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001
-            data = {}
-        if not data and os.path.exists(HWSCAN_CLI):
-            try:
-                r = subprocess.run([HWSCAN_CLI, "--json"], capture_output=True,
-                                   text=True, timeout=3)
-                if r.returncode == 0:
-                    data = json.loads(r.stdout)
-            except Exception:  # noqa: BLE001
-                data = {}
+        data = desktop.load_hwscan()
         self.got.emit(data if isinstance(data, dict) else {})
 
 
@@ -920,9 +907,29 @@ class InstallRunner(QThread):
         self.proc = None
 
     def run(self):
+        # Built by the shared library, not spelled out here. This call site
+        # used to assemble its own argv, and it named pkexec by the bare word
+        # rather than by path -- so the session's $PATH decided which program
+        # the Install button asks for an administrator password. That is a
+        # security defect and not a style one: a same-user process able to
+        # prepend a directory to PATH becomes that program, or swallows the
+        # install and reports success. The Control Center already named pkexec
+        # absolutely, and the divergence between two copies of one privileged
+        # argv is what W-30 is about.
+        #
+        # None means pkexec or the helper is missing, and the panel says so
+        # rather than falling back to anything more general.
+        argv = desktop.bundle_install_argv(self.catalog_id)
+        if argv is None:
+            self.eventd.emit(
+                "ERROR", f"helper-missing pkexec or {desktop.BUNDLE_INSTALL} "
+                "is not installed, so nothing was authorised and nothing was "
+                "changed")
+            self.finished_rc.emit(1)
+            return
         try:
             self.proc = subprocess.Popen(
-                ["pkexec", BUNDLE_HELPER, "install", self.catalog_id],
+                argv,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, bufsize=1,
             )
@@ -980,6 +987,14 @@ class InstallPanel(QWidget):
         self.bar = QProgressBar()
         self.bar.setRange(0, 100)
         self.bar.setValue(0)
+        # The percentage sits beside the title in TEXT, not inside the 10px
+        # bar: a stylesheet'd QProgressBar paints its label in ONE colour
+        # across both the gold chunk and the dark trough, so no colour reads
+        # on both (5.0.0 VM QA: grey "100%" on gold was near-invisible).
+        self.bar.setTextVisible(False)
+        self.pct = _label("0%", 12, TEXT, bold=True)
+        self.bar.valueChanged.connect(
+            lambda value: self.pct.setText(f"{value}%"))
         self.msg = _label("", 11, MUTED, wrap=True)
         self.lock_note = _label("", 11, GOLD, wrap=True)
         self.lock_note.hide()
@@ -991,7 +1006,10 @@ class InstallPanel(QWidget):
         row.addStretch(1)
         row.addWidget(self.cancel_btn)
 
-        lay.addWidget(self.stage_title)
+        head = QHBoxLayout()
+        head.addWidget(self.stage_title, 1)
+        head.addWidget(self.pct)
+        lay.addLayout(head)
         lay.addWidget(self.bar)
         lay.addWidget(self.msg)
         lay.addWidget(self.lock_note)
@@ -1121,7 +1139,7 @@ class InstallPanel(QWidget):
                     "You can retry, or restore the Point taken just before "
                     "it started - your personal files are untouched either way.")
             self.restore_btn.setText(f"Restore Point #{self.point}")
-            self.restore_btn.setVisible(os.path.exists(PHOENIX_RESTORE))
+            self.restore_btn.setVisible(os.path.exists(desktop.PHOENIX_RESTORE))
         else:
             if self.nopoint_reason == "not-btrfs":
                 self.fail_title.setText(
@@ -1155,14 +1173,27 @@ class InstallPanel(QWidget):
     def _restore(self):
         if self.point is None:
             return
+        # pkexec by absolute path out of the shared trusted program table,
+        # never the bare name the session's $PATH resolves: this button asks
+        # for an administrator password and then rolls the system back, so
+        # which binary receives that password is the whole question. The
+        # Control Center's Recover page already named it absolutely
+        # (sfcc/phoenix_page.py); this call site did not.
+        pkexec = desktop.trusted_program("pkexec")
+        if pkexec is None:
+            self.fail_body.setText(
+                "pkexec is not installed, so this restore cannot be "
+                "authorised. Nothing was changed - open Control Center - "
+                "Recover for the full Phoenix panel.")
+            return
         self.retry_btn.setEnabled(False)
         self.restore_btn.setEnabled(False)
         self.fail_body.setText(
             f"Restoring Phoenix Point #{self.point}... this swaps the "
             "system back atomically and asks for a reboot when done.")
         self._restore_worker = CommandWorker(
-            [["pkexec", PHOENIX_RESTORE, str(self.point)]])
-        self._restore_worker.finished.connect(self._restored)
+            [[pkexec, desktop.PHOENIX_RESTORE, str(self.point)]])
+        self._restore_worker.completed.connect(self._restored)
         self._restore_worker.start()
 
     def _restored(self, rc):
@@ -1192,7 +1223,7 @@ class InstallPanel(QWidget):
 
 # ---- Ignition ------------------------------------------------------------
 class BundleCard(Card):
-    """A selectable flame card: name, blurb, measured size, the 'already on
+    """A selectable bundle card: name, blurb, measured size, the 'already on
     your system' strip, and (AI card) the inline hardware verdict."""
     picked = pyqtSignal(str)
 
@@ -1295,7 +1326,7 @@ class IgnitionFlow(QWidget):
         lay.setSpacing(10)
 
         head = QHBoxLayout()
-        title = "Pick your flame" if not IGNITION_DONE.exists() else "Change your setup"
+        title = "Choose your setup" if not IGNITION_DONE.exists() else "Change your setup"
         head.addWidget(_label(title, 24, TEXT, bold=True))
         head.addStretch(1)
         self.badge = _label("", 11, MUTED)
@@ -1304,8 +1335,8 @@ class IgnitionFlow(QWidget):
 
         sub = ("Core boots ready with zero downloads - browser, privacy tools, "
                "everything essential. Creator, Developer, and AI Workstation "
-               "are one click and one Phoenix-protected install away. Chose "
-               "offline? Your pick is saved and offered the moment you connect.")
+               "are one click and one Phoenix-protected install away. Offline "
+               "right now? Your pick is saved and offered the moment you connect.")
         if IGNITION_DONE.exists():
             sub = ("Bundles are additive - anything already installed shows on "
                    "its card. Removing a bundle is on the roadmap.")
@@ -1329,7 +1360,7 @@ class IgnitionFlow(QWidget):
         if not self.cards:
             vbox.addWidget(_label(
                 "No bundle catalog found on this system - the Welcome package "
-                "may be incomplete. You can continue without picking a flame.",
+                "may be incomplete. You can continue without picking a bundle.",
                 12, MUTED, wrap=True))
         vbox.addStretch(1)
         scroll.setWidget(container)
@@ -1589,8 +1620,17 @@ class IgnitionFlow(QWidget):
             "completed")
 
     def _state_call(self, args, on_done):
-        self._state_worker = CommandWorker([["pkexec", STATE_HELPER] + args])
-        self._state_worker.finished.connect(on_done)
+        # STATE_HELPER is this package's own payload and is already absolute.
+        # pkexec was not: a bare name here is resolved by the session's $PATH,
+        # and this call writes the Ignition state file as root. A missing
+        # pkexec reports the failure the callers already render honestly
+        # rather than launching anything.
+        pkexec = desktop.trusted_program("pkexec")
+        if pkexec is None:
+            on_done(1)
+            return
+        self._state_worker = CommandWorker([[pkexec, STATE_HELPER] + args])
+        self._state_worker.completed.connect(on_done)
         self._state_worker.start()
 
     # -- result --
@@ -1648,7 +1688,7 @@ class IgnitionFlow(QWidget):
 CATALOG_SECTIONS = [
     ("media",   "Media & Creative"),
     ("presets", "Presets"),
-    ("ai",      "Local AI"),
+    ("ai",      "Workspace tools"),
     ("power",   "Power tools"),
 ]
 
@@ -1694,7 +1734,7 @@ class InstallDialog(QDialog):
 
 
 class CatalogPage(QWidget):
-    """The one-click media and preset catalog, plus verified Local AI entry."""
+    """The one-click media and preset catalog, plus workspace tooling."""
 
     def __init__(self, catalog: dict, sizes: dict, watcher: NMWatcher,
                  focus_section=None, on_back=None, parent=None):
@@ -1719,7 +1759,7 @@ class CatalogPage(QWidget):
         lay.addLayout(head)
         lay.addWidget(_label(
             "Apps and presets install from the pinned Shadowfetch mirrors. "
-            "Buzz manages hardware-aware open model selection and download. "
+            "Grok Bot and coding agents are available during setup. "
             "Nothing downloads until you confirm.",
             12, MUTED, wrap=True))
 
@@ -1730,7 +1770,7 @@ class CatalogPage(QWidget):
         vbox.setContentsMargins(0, 4, 6, 4)
         vbox.setSpacing(10)
 
-        scan = hwscan_cached()
+        scan = desktop.hwscan_cached()
         nvidia = hwscan_has_nvidia(scan)
         btrfs = root_is_btrfs()
 
@@ -1747,9 +1787,6 @@ class CatalogPage(QWidget):
             vbox.addWidget(header)
             recs = by_section.get(key, [])
             shown = 0
-            if key == "ai":
-                vbox.addWidget(self._local_ai_card())
-                shown += 1
             for rec in recs:
                 requires = rec.get("requires") or []
                 if "nvidia" in requires and not nvidia:
@@ -1772,42 +1809,7 @@ class CatalogPage(QWidget):
         if header is not None:
             self.scroll.ensureWidgetVisible(header, 0, 40)
 
-    def _local_ai_card(self) -> QWidget:
-        card = Card()
-        row = QHBoxLayout(card)
-        row.setContentsMargins(16, 12, 16, 12)
-        text = QVBoxLayout()
-        text.setSpacing(2)
-        text.addWidget(_label("Buzz shared compute", 13, TEXT, bold=True))
-        text.addWidget(_label(
-            "Buzz ranks open-source models for this computer, shows the "
-            "recommended fit, and asks before downloading. Its model endpoint "
-            "stays on this machine.",
-            11, MUTED, wrap=True))
-        text.addWidget(_label(
-            "Official Buzz model catalog - native shared compute - localhost only",
-            10, MUTED, wrap=True))
-        row.addLayout(text, 1)
-        button = QPushButton("Open Local AI")
-        button.setFixedHeight(38)
-        button.clicked.connect(self._open_local_ai)
-        row.addWidget(button, 0, Qt.AlignmentFlag.AlignVCenter)
-        return card
 
-    def _open_local_ai(self):
-        for command in (
-                ["shadowfetch-control", "--page", "local-ai"],
-                ["konsole", "-e", "shadowfetch-buzz", "setup"]):
-            if not shutil.which(command[0]):
-                continue
-            try:
-                subprocess.Popen(command)
-                return
-            except OSError:
-                continue
-        QMessageBox.information(
-            self, "Local AI unavailable",
-            "The Local AI tools are not installed on this system.")
 
     def _entry_card(self, rec: dict, btrfs: bool) -> QWidget:
         card = Card()
@@ -1864,17 +1866,53 @@ class CatalogPage(QWidget):
             btn.setEnabled(False)
 
     def _template(self, rec: dict):
-        for cmd in (["shadowfetch-agent-workspace"],
-                    ["konsole", "-e", "shadowfetch-agent-workspace"]):
-            if shutil.which(cmd[0]):
-                try:
-                    subprocess.Popen(cmd)
-                    return
-                except Exception:  # noqa: BLE001
-                    continue
-        QMessageBox.information(
-            self, "Not installed",
-            "The workspace tool is not installed on this system.")
+        """Create the workspace here, with the name as an argument.
+
+        This used to spawn `shadowfetch-agent-workspace` with no verb. That
+        form opens an interactive shell menu whose first act is a `read` on
+        stdin; started from a desktop button there is no terminal, the read
+        gets EOF, and the tool exits under `set -e` having created nothing.
+        The konsole candidate listed after it could never run either, because
+        `which` finds the tool itself whenever it is installed. The `create`
+        verb takes the name as an argument and needs no terminal at all - the
+        same shape the Control Center's Workbench already uses.
+        """
+        # From the shared trusted program table: an absolute path checked
+        # against a fixed set of system directories. shutil.which asks the
+        # session's $PATH which program this button runs, which is the same
+        # defect as the bare pkexec above, one privilege level down.
+        helper = desktop.trusted_program("shadowfetch-agent-workspace")
+        if not helper:
+            QMessageBox.information(
+                self, "Not installed",
+                "The workspace tool is not installed on this system.")
+            return
+        title = str(rec.get("name") or "workspace")
+        name, accepted = QInputDialog.getText(
+            self, f"New {title}", "Workspace name:")
+        if not accepted or not name.strip():
+            return
+        try:
+            done = subprocess.run(
+                [helper, "create", name.strip()],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                timeout=30, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            QMessageBox.warning(
+                self, "Workspace not created",
+                f"The workspace tool did not run: {exc}")
+            return
+        if done.returncode == 0:
+            QMessageBox.information(
+                self, "Workspace created",
+                # The helper's own two lines name the path and how to open it.
+                # Reprinting them beats parsing them into a second wording.
+                done.stdout.strip() or f"Created workspace {name.strip()}.")
+        else:
+            QMessageBox.warning(
+                self, "Workspace not created",
+                (done.stderr or done.stdout).strip()
+                or "The workspace tool reported an error. Nothing was created.")
 
 
 # ---- pages ---------------------------------------------------------------
@@ -1882,158 +1920,84 @@ class WelcomePage(QWidget):
     def __init__(self, on_next, on_ignition=None, on_catalog=None,
                  on_guide=None, on_workbench=None):
         super().__init__()
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(56, 56, 56, 48)
-        lay.setSpacing(18)
-
-        logo = QLabel()
-        icon = QIcon.fromTheme("shadowfetch")
-        if not icon.isNull():
-            logo.setPixmap(icon.pixmap(QSize(72, 72)))
-
-        title = _label("Welcome to Shadowfetch Linux", 30, TEXT, bold=True)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        lay = QVBoxLayout(content)
+        lay.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+        lay.setContentsMargins(40, 34, 40, 30)
+        lay.setSpacing(14)
         version_file = Path("/usr/share/shadowfetch/version")
         version = os.environ.get("SHADOWFETCH_VERSION_OVERRIDE", "").strip()
         if not version and version_file.is_file():
             version = version_file.read_text().strip()
-        element_name = "Ice" if ELEMENT == "ice" else "Fire"
-        edition = f"{element_name} Edition {version}" if version else f"{element_name} Edition"
-        tag = _label(f"{edition}  |  Fire and Ice Workbench", 15, GOLD, bold=True)
-        body = _label(
-            "A fast, private, AI-ready desktop - honestly built on Debian and "
-            "KDE Plasma 6.\nOn the default Btrfs install every update is snapshotted, "
-            "so you can roll back a bad change with the built-in Btrfs Assistant.\n"
-            "Shadowfetch Guide checks what works without uploading your computer's "
-            "identity. Element Workbench creates production-ready software, AI, "
-            "operations and creative projects with explicit safety boundaries. Then "
-            "pick an app profile and optionally install Buzz or one "
-            "or more coding agents. Buzz ranks and downloads an open model from its "
-            "Compute settings.",
-            13, MUTED, wrap=True,
-        )
-
-        nxt = QPushButton("Get started  →")
-        nxt.setFixedHeight(46)
-        nxt.clicked.connect(on_next)
-
-        lay.addStretch(1)
-        if logo.pixmap() is not None and not logo.pixmap().isNull():
-            lay.addWidget(logo)
-        lay.addWidget(title)
-        lay.addWidget(tag)
-        lay.addSpacing(6)
-        lay.addWidget(body)
-
-        # Passive, non-modal Ignition badge: discovery survives 'Decide
-        # later' without any full-screen re-offer (judge fold, nag rule).
-        links = QHBoxLayout()
-        if on_guide is not None:
-            guide = QPushButton("Check this computer")
-            guide.setFixedHeight(38)
-            guide.setToolTip("Open the private, read-only Shadowfetch System Passport")
-            guide.clicked.connect(on_guide)
-            links.addWidget(guide)
-        if on_workbench is not None:
-            workbench = QPushButton("Open Element Workbench")
-            workbench.setFixedHeight(38)
-            workbench.setToolTip("Plan tools and create a production workspace")
-            workbench.clicked.connect(on_workbench)
-            links.addWidget(workbench)
-        if on_ignition is not None:
-            badge = QPushButton("Ignition - pick your flame  →")
-            badge.setFixedHeight(38)
-            badge.clicked.connect(on_ignition)
-            links.addWidget(badge)
-        if on_catalog is not None:
-            cat = QPushButton("Browse the software catalog  →")
-            cat.setFixedHeight(38)
-            cat.clicked.connect(on_catalog)
-            links.addWidget(cat)
-        links.addStretch(1)
-        lay.addLayout(links)
-
-        lay.addStretch(2)
-        lay.addWidget(nxt, alignment=Qt.AlignmentFlag.AlignRight)
-
-
-class ElementPage(QWidget):
-    """Fire and Ice: pick the element. Everything after this page branches on it.
-
-    Changing the element relaunches the wizard so every page — palette, profile
-    order, agent defaults — rebuilds around the new element. The page is first
-    in the flow, so nothing the user has entered is lost by the relaunch.
-    """
-    def __init__(self, on_next):
-        super().__init__()
-        self._on_next = on_next
-        self.selected = ELEMENT
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(48, 40, 48, 32)
-        lay.setSpacing(12)
-        lay.addWidget(_label("Choose your element", 22, TEXT, bold=True))
+        lay.addWidget(_label(f"SHADOWFETCH LINUX {version}  /  SHADOWCODE", 13, GOLD, bold=True))
+        lay.addWidget(_label("Your computer. Your agents.", 30, TEXT, bold=True))
         lay.addWidget(_label(
-            "Fire and Ice are two complete identities for this system. The choice "
-            "changes the look AND the defaults that follow — and every difference "
-            "is stated plainly. You can switch any time with shadowfetch-element.",
-            12, MUTED, wrap=True))
-        lay.addSpacing(6)
-        options = (
-            ("fire", "Fire — run hot", "#D8A24A",
-             "Umbra gold and the ember desktop. Firebreak agent sandboxes may use "
-             "the network by default. Setup leads with creative, gaming and "
-             "full-auto agent profiles."),
-            ("ice", "Ice — run cold", "#4AA2D8",
-             "Glacier azure and the frost desktop. Firebreak agent sandboxes start "
-             "with NO network — you grant it per session, deliberately. Setup leads "
-             "with the private developer and fully-local AI profiles."),
-        )
-        self._radios = {}
-        group = QButtonGroup(self)
-        for key, name, hexc, desc in options:
+            "Work you can inspect. Mission Control brings tasks, progress, output files "
+            "and review together on your Debian + KDE Plasma desktop.",
+            13, MUTED, wrap=True))
+        feature = Card()
+        feature.setStyleSheet(f"QFrame {{ background: {CARD}; border: 1px solid {GOLD}; border-radius: 10px; }} QLabel {{border: 0;}}")
+        feature_row = QHBoxLayout(feature)
+        feature_row.setContentsMargins(22, 18, 22, 18)
+        copy = QVBoxLayout()
+        copy.setSpacing(6)
+        copy.addWidget(_label("ONE HARNESS. ALL MODELS.", 11, GOLD, bold=True))
+        copy.addWidget(_label("ShadowCode", 28, TEXT, bold=True))
+        copy.addWidget(_label("The coding agent built into this desktop. Pick a model from a subscription you already have, an API key, or one that runs on this computer, then review every change it makes. Setup ends by connecting your services.", 11, MUTED, wrap=True))
+        feature_row.addLayout(copy, 1)
+        explore = QPushButton("Open ShadowCode  →")
+        explore.clicked.connect(self._open_shadowcode)
+        feature_row.addWidget(explore)
+        lay.addWidget(feature)
+        points = QGridLayout()
+        for i, (title, detail) in enumerate((
+            ("01  Choose your scope", "One project, an explicit connection and the provider you choose."),
+            ("02  Watch work progress", "Persistent code, source report and media missions with activity receipts."),
+            ("03  Review the evidence", "Inspect files and changes. Accept results or restore local mission changes."),
+        )):
             card = Card()
-            row = QHBoxLayout(card)
-            row.setContentsMargins(16, 14, 16, 14)
-            rb = QRadioButton()
-            rb.setChecked(key == ELEMENT)
-            group.addButton(rb)
-            self._radios[key] = rb
-            rb.toggled.connect(lambda checked, k=key: self._set(k) if checked else None)
-            txt = QVBoxLayout()
-            txt.setSpacing(3)
-            txt.addWidget(_label(name, 15, hexc, bold=True))
-            txt.addWidget(_label(desc, 11, MUTED, wrap=True))
-            row.addWidget(rb, 0, Qt.AlignmentFlag.AlignTop)
-            row.addLayout(txt, 1)
-            lay.addWidget(card)
+            row = QVBoxLayout(card)
+            row.setContentsMargins(14, 12, 14, 12)
+            row.addWidget(_label(title, 12, GOLD, bold=True))
+            row.addWidget(_label(detail, 11, MUTED, wrap=True))
+            points.addWidget(card, 0, i)
+        lay.addLayout(points)
+        lay.addWidget(_label("Local-first · No Shadowfetch account required", 11, MUTED, wrap=True))
+        links = QGridLayout()
+        callbacks = [("Open Mission Control", lambda: open_control_page("missions"))]
+        if on_guide:
+            callbacks.append(("Check this computer", on_guide))
+        if on_workbench:
+            callbacks.append(("Open Workbench", on_workbench))
+        if on_catalog:
+            callbacks.append(("Software catalog", on_catalog))
+        if on_ignition:
+            callbacks.append(("Ignition bundles", on_ignition))
+        for i, (name, callback) in enumerate(callbacks):
+            button = QPushButton(name)
+            button.setFixedHeight(36)
+            button.clicked.connect(callback)
+            links.addWidget(button, i // 3, i % 3)
+        lay.addLayout(links)
         lay.addStretch(1)
-        nxt = QPushButton("Continue  →")
+        nxt = QPushButton("Set up my desktop  →")
         nxt.setFixedHeight(44)
-        nxt.clicked.connect(self._submit)
+        nxt.clicked.connect(on_next)
         lay.addWidget(nxt, alignment=Qt.AlignmentFlag.AlignRight)
 
-    def _set(self, key):
-        self.selected = key
-
-    def _submit(self):
-        chosen = self.selected
-        conf = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "shadowfetch" / "element"
-        try:
-            conf.parent.mkdir(parents=True, exist_ok=True)
-            conf.write_text(chosen + "\n")
-        except OSError:
-            pass
-        if chosen == ELEMENT:
-            self._on_next()
-            return
-        # Apply the look to the running session (best effort), then relaunch the
-        # wizard so every page rebuilds in the new element.
-        try:
-            subprocess.Popen(["shadowfetch-element", "apply"],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
-        os.environ["SHADOWFETCH_ELEMENT"] = chosen
-        os.execv(sys.executable, [sys.executable, os.path.abspath(sys.argv[0])] + sys.argv[1:])
+    def _open_shadowcode(self):
+        if not open_shadowcode():
+            QMessageBox.warning(
+                self, "ShadowCode could not be started",
+                "Open it from the application menu, or reinstall the shadow-code "
+                "package from Software.")
 
 
 class ProfilePage(QWidget):
@@ -2048,23 +2012,21 @@ class ProfilePage(QWidget):
         lay.setSpacing(12)
 
         lay.addWidget(_label("Choose an app profile", 22, TEXT, bold=True))
-        element_line = (
-            "You are in the Ice element: run cold — agent sandboxes start with no "
-            "network, and the calm profiles lead."
-            if ELEMENT == "ice" else
-            "You are in the Fire element: run hot — agent sandboxes may use the "
-            "network, and the creative profiles lead."
-        )
         lay.addWidget(_label(
             "Pick one or more starting points. Shadowfetch will preselect the right "
             "apps and AI setup options, and you can still change every choice on the "
-            "next screens. " + element_line + " Every profile says exactly which AI "
-            "tools it installs.",
+            "next screens. Every profile says exactly which AI tools it installs.",
             12, MUTED, wrap=True,
         ))
 
-        grid = QVBoxLayout()
+        self.profile_scroll = QScrollArea()
+        self.profile_scroll.setWidgetResizable(True)
+        self.profile_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        container = QWidget()
+        grid = QVBoxLayout(container)
+        grid.setContentsMargins(0, 0, 6, 0)
         grid.setSpacing(10)
+        grid.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         for preset in PROFILE_PRESETS:
             card = Card()
             row = QHBoxLayout(card)
@@ -2078,8 +2040,9 @@ class ProfilePage(QWidget):
             row.addLayout(txt, 1)
             self.checks.append((cb, preset["key"]))
             grid.addWidget(card)
-        lay.addLayout(grid)
-        lay.addStretch(1)
+        grid.addStretch(1)
+        self.profile_scroll.setWidget(container)
+        lay.addWidget(self.profile_scroll, 1)
 
         buttons = QHBoxLayout()
         manual = QPushButton("Choose manually")
@@ -2286,134 +2249,6 @@ class GraphicsPage(QWidget):
                 pass
 
 
-class AccentSwatch(QWidget):
-    """A colour chip with the name underneath - label never clips."""
-    clicked = pyqtSignal(str, str)
-
-    def __init__(self, name, hexc):
-        super().__init__()
-        self.name = name
-        self.hexc = hexc
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        v = QVBoxLayout(self)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(8)
-        self.chip = QFrame()
-        self.chip.setFixedSize(96, 56)
-        self.lab = _label(name, 11, MUTED)
-        self.lab.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        v.addWidget(self.chip, alignment=Qt.AlignmentFlag.AlignHCenter)
-        v.addWidget(self.lab)
-        self.set_selected(False)
-
-    def set_selected(self, sel):
-        border = f"3px solid {TEXT}" if sel else f"1px solid {BORDER}"
-        self.chip.setStyleSheet(
-            f"background-color: {self.hexc}; border: {border}; border-radius: 10px;"
-        )
-        weight = "700" if sel else "400"
-        self.lab.setStyleSheet(
-            f"color: {GOLD if sel else MUTED}; background: transparent; font-weight: {weight};"
-        )
-
-    def mousePressEvent(self, ev):
-        self.clicked.emit(self.name, self.hexc)
-
-
-class AccentPage(QWidget):
-    def __init__(self, on_next):
-        super().__init__()
-        self.selected_name = ACCENTS[0][0]
-        self.selected_hex = ACCENTS[0][1]
-        self.swatches = []
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(48, 48, 48, 40)
-        lay.setSpacing(14)
-
-        lay.addWidget(_label("Choose your accent colour", 22, TEXT, bold=True))
-        lay.addWidget(_label(
-            "Used for highlights, active windows and controls across the desktop. "
-            "You can change it any time in System Settings.",
-            12, MUTED, wrap=True,
-        ))
-        lay.addSpacing(12)
-
-        grid = QHBoxLayout()
-        grid.setSpacing(14)
-        grid.addStretch(1)
-        for name, hexc in ACCENTS:
-            sw = AccentSwatch(name, hexc)
-            sw.clicked.connect(self._select)
-            self.swatches.append(sw)
-            grid.addWidget(sw)
-        grid.addStretch(1)
-        lay.addLayout(grid)
-
-        # --- Wallpaper picker (applies live, lock screen too) ---
-        import glob as _glob
-        lay.addSpacing(18)
-        lay.addWidget(_label("Choose your wallpaper", 16, TEXT, bold=True))
-        self._wp_btns = []
-        wrow = QHBoxLayout()
-        wrow.setSpacing(10)
-        wrow.addStretch(1)
-        for wp in sorted(_glob.glob("/usr/share/wallpapers/Umbra*/contents/images/3840x2160.jpg")):
-            vid = wp.split("/")[4]
-            btn = QPushButton()
-            btn.setCheckable(True)
-            btn.setFixedSize(172, 101)
-            btn.setToolTip(vid.replace("Umbra", "Umbra "))
-            try:
-                from PyQt6.QtGui import QPixmap as _QPM, QIcon as _QI
-                from PyQt6.QtCore import QSize as _QS
-                pm = _QPM(wp).scaled(166, 93,
-                        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                        Qt.TransformationMode.SmoothTransformation)
-                btn.setIcon(_QI(pm))
-                btn.setIconSize(_QS(166, 93))
-            except Exception:
-                btn.setText(vid)
-            btn.setStyleSheet(
-                "QPushButton{border:2px solid #2a313b;border-radius:8px;background:#11151b;}"
-                "QPushButton:checked{border:2px solid %s;}" % GOLD)
-            if vid == ("UmbraIce" if ELEMENT == "ice" else "UmbraGold"):
-                btn.setChecked(True)
-            btn.clicked.connect(lambda _c, p=wp, b=btn: self._pick_wallpaper(p, b))
-            self._wp_btns.append(btn)
-            wrow.addWidget(btn)
-        wrow.addStretch(1)
-        lay.addLayout(wrow)
-
-        lay.addSpacing(10)
-        lay.addWidget(_label("Applies after your next login.", 11, MUTED))
-        lay.addStretch(1)
-
-        nxt = QPushButton("Continue  →")
-        nxt.setFixedHeight(44)
-        nxt.clicked.connect(lambda: on_next(self.selected_name, self.selected_hex))
-        lay.addWidget(nxt, alignment=Qt.AlignmentFlag.AlignRight)
-
-        self._select(self.selected_name, self.selected_hex)
-
-    def _select(self, name, hexc):
-        self.selected_name, self.selected_hex = name, hexc
-        for sw in self.swatches:
-            sw.set_selected(sw.name == name)
-
-    def _pick_wallpaper(self, path, btn):
-        for b in self._wp_btns:
-            b.setChecked(b is btn)
-        try:
-            subprocess.Popen(["plasma-apply-wallpaperimage", path])
-            subprocess.Popen(["kwriteconfig6", "--file", "kscreenlockerrc",
-                              "--group", "Greeter", "--group", "Wallpaper",
-                              "--group", "org.kde.image", "--group", "General",
-                              "--key", "Image", path])
-        except Exception:
-            pass
-
-
 class AppsPage(QWidget):
     def __init__(self, on_next):
         super().__init__()
@@ -2492,74 +2327,67 @@ class AppsPage(QWidget):
         self.profile_hint.setText("Preset selections applied: " + ", ".join(names) + ". Adjust anything before continuing.")
 
 
-class BuzzPage(QWidget):
-    """Offer official Buzz, native open models, and optional coding agents."""
+class AgentSetupPage(QWidget):
+    """The agent network choice and the three optional agents, and nothing else."""
     def __init__(self, on_next):
         super().__init__()
         self._on_next = on_next
-        self.choice = "install-buzz"
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(48, 40, 48, 32)
-        lay.setSpacing(12)
-        lay.addWidget(_label("Choose your AI workspace", 22, TEXT, bold=True))
-        element_line = (
-            "Ice element: any coding agent you pick runs in Firebreak with NO network "
-            "by default — you grant it per session."
-            if ELEMENT == "ice" else
-            "Fire element: coding agents you pick run in Firebreak with network "
-            "allowed by default."
-        )
+        lay.setContentsMargins(36, 26, 36, 24)
+        lay.setSpacing(10)
+        lay.addWidget(_label("Choose optional agents", 24, TEXT, bold=True))
         lay.addWidget(_label(
-            "Buzz gives people and AI agents shared rooms, project context, and native shared "
-            "compute. Shadowfetch installs the official desktop and a private relay. Buzz then "
-            "ranks open-source models for this hardware and asks before downloading one. "
-            "Cloud coding agents are separate, optional tools with their own sign-in. "
-            + element_line,
-            12, MUTED, wrap=True))
-        lay.addSpacing(6)
-        self.group = QButtonGroup(self)
-        opts = [
-            ("install-buzz", "Install Buzz", "Recommended. Verifies Buzz Desktop, starts its loopback-only relay, then opens Buzz for its native model choice."),
-            ("none", "Not now", "Skip Buzz. It remains available from the Local AI menu."),
-        ]
-        self.choice_radios = {}
-        for key, name, desc in opts:
-            card = Card()
-            row = QHBoxLayout(card)
-            row.setContentsMargins(16, 12, 16, 12)
-            rb = QRadioButton()
-            self.choice_radios[key] = rb
-            rb.setChecked(key == "install-buzz")
-            rb.toggled.connect(lambda checked, k=key: self._set(k) if checked else None)
-            self.group.addButton(rb)
-            txt = QVBoxLayout()
-            txt.setSpacing(2)
-            txt.addWidget(_label(name, 13, GOLD if key == "install-buzz" else TEXT, bold=True))
-            txt.addWidget(_label(desc, 11, MUTED, wrap=True))
-            row.addWidget(rb, 0, Qt.AlignmentFlag.AlignTop)
-            row.addLayout(txt, 1)
-            lay.addWidget(card)
+            "ShadowCode is already installed, and the last step connects it to your services. "
+            "Grok Bot, Hermes and OpenClaw are optional: each downloads only if you pick it, "
+            "and each uses its own account or model provider.",
+            11, MUTED, wrap=True))
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        content = QVBoxLayout(body)
+        content.setContentsMargins(0, 0, 6, 4)
+        content.setSpacing(10)
+
+        network = Card()
+        network.setStyleSheet(f"QFrame {{background: {CARD}; border: 1px solid {GOLD}; border-radius: 10px;}} QLabel {{border: 0;}}")
+        net_lay = QVBoxLayout(network)
+        net_lay.setContentsMargins(18, 14, 18, 14)
+        net_lay.setSpacing(6)
+        net_lay.addWidget(_label("AGENT NETWORK", 10, GOLD, bold=True))
+        self.network_group = QButtonGroup(self)
+        self.network_choice = {}
+        for value, title, detail in (
+            ("online", "Online (recommended)",
+             "Agent sandboxes may use the network, and cloud agents can be installed and opened."),
+            ("offline", "Offline",
+             "Agent sandboxes start with no network; you allow it per session. Cloud agents stay "
+             "paused until you turn the agent network on."),
+        ):
+            radio = QRadioButton(title)
+            radio.setAccessibleName(f"Agent network {value}")
+            self.network_group.addButton(radio)
+            self.network_choice[value] = radio
+            net_lay.addWidget(radio)
+            net_lay.addWidget(_label(detail, 10, MUTED, wrap=True))
+        net_lay.addWidget(_label("Change it later with shadowfetch-agent-network.", 10, MUTED, wrap=True))
+        self.network_choice[desktop.agent_network()].setChecked(True)
+        content.addWidget(network)
 
         agent_heading = QHBoxLayout()
-        agent_heading.addWidget(_label("Optional coding agents", 12, MUTED, bold=True))
+        agent_heading.addWidget(_label("Optional agents", 12, MUTED, bold=True))
         agent_heading.addStretch(1)
-        self.select_all_agents = QCheckBox("Select all four")
-        self.select_all_agents.setChecked(False)
+        self.select_all_agents = QCheckBox("Select all three")
         self.select_all_agents.toggled.connect(self._toggle_all_agents)
         agent_heading.addWidget(self.select_all_agents)
-        lay.addLayout(agent_heading)
-
+        content.addLayout(agent_heading)
         self.coding_agents = {}
-        agent_grid = QGridLayout()
-        agent_grid.setHorizontalSpacing(10)
-        agent_grid.setVerticalSpacing(10)
-        for index, agent in enumerate(CODING_AGENTS):
+        for agent in CODING_AGENTS:
             card = Card()
-            card.setMinimumHeight(88)
             row = QHBoxLayout(card)
-            row.setContentsMargins(14, 10, 14, 10)
+            row.setContentsMargins(14, 11, 14, 11)
             checkbox = QCheckBox()
             checkbox.setChecked(False)
+            checkbox.setAccessibleName("Install " + agent["name"])
             checkbox.toggled.connect(self._sync_select_all_agents)
             text = QVBoxLayout()
             text.setSpacing(2)
@@ -2568,66 +2396,72 @@ class BuzzPage(QWidget):
             row.addWidget(checkbox, 0, Qt.AlignmentFlag.AlignTop)
             row.addLayout(text, 1)
             self.coding_agents[agent["key"]] = checkbox
-            agent_grid.addWidget(card, index // 2, index % 2)
-        lay.addLayout(agent_grid)
-
-        lay.addStretch(1)
+            content.addWidget(card)
+        self.offline_note = _label(
+            "The agent network is offline, so the optional agents are paused. Choose Online above to pick them.",
+            10, GOLD, wrap=True)
+        content.addWidget(self.offline_note)
+        content.addStretch(1)
+        scroll.setWidget(body)
+        lay.addWidget(scroll, 1)
         nxt = QPushButton("Continue  →")
-        nxt.setFixedHeight(44)
+        nxt.setFixedHeight(42)
         nxt.clicked.connect(self._submit)
         lay.addWidget(nxt, alignment=Qt.AlignmentFlag.AlignRight)
+        self.network_group.buttonToggled.connect(lambda *_: self._apply_network())
+        self._apply_network()
 
-    def _set(self, key):
-        self.choice = key
+    def selected_network(self):
+        return "offline" if self.network_choice["offline"].isChecked() else "online"
+
+    def _apply_network(self):
+        offline = self.selected_network() == "offline"
+        for checkbox in self.coding_agents.values():
+            checkbox.setEnabled(not offline)
+            if offline:
+                checkbox.setChecked(False)
+        self.select_all_agents.setEnabled(not offline)
+        self.offline_note.setVisible(offline)
+        self._sync_select_all_agents()
 
     def apply_profiles(self, profile_keys):
-        """Preseed this page from the chosen profiles — their AI statements are
-        promises, and this is where the promise is kept (still fully editable)."""
         agents = set()
-        want_buzz = False
         for key in profile_keys:
             preset = PROFILE_BY_KEY.get(key)
-            if not preset:
-                continue
-            agents.update(preset.get("agents", []))
-            if preset.get("ai_choice") == "install-buzz":
-                want_buzz = True
+            if preset:
+                agents.update(preset.get("agents", []))
         for key, checkbox in self.coding_agents.items():
-            if key in agents:
-                checkbox.setChecked(True)   # plain setChecked keeps select-all in sync
-        if want_buzz and "install-buzz" in self.choice_radios:
-            self.choice_radios["install-buzz"].setChecked(True)
+            if key in agents and checkbox.isEnabled():
+                checkbox.setChecked(True)
 
     def _toggle_all_agents(self, checked):
         for checkbox in self.coding_agents.values():
             checkbox.blockSignals(True)
-            checkbox.setChecked(checked)
+            checkbox.setChecked(checked and checkbox.isEnabled())
             checkbox.blockSignals(False)
 
     def _sync_select_all_agents(self, _checked=None):
-        all_selected = all(checkbox.isChecked() for checkbox in self.coding_agents.values())
+        available = [checkbox for checkbox in self.coding_agents.values() if checkbox.isEnabled()]
         self.select_all_agents.blockSignals(True)
-        self.select_all_agents.setChecked(all_selected)
+        self.select_all_agents.setChecked(bool(available) and all(c.isChecked() for c in available))
         self.select_all_agents.blockSignals(False)
 
     def _submit(self):
-        coding_agents = {
-            key: checkbox.isChecked() for key, checkbox in self.coding_agents.items()
-        }
-        self._on_next({
-            "choice": self.choice,
-            "coding_agents": coding_agents,
-            "codex": coding_agents["codex"],
-        })
+        network = self.selected_network()
+        try:
+            desktop.set_agent_network(network)
+        except OSError:
+            pass
+        coding_agents = {key: checkbox.isChecked() and checkbox.isEnabled() for key, checkbox in self.coding_agents.items()}
+        self._on_next({"coding_agents": coding_agents, "agent_network": network})
 
 
 class InstallPage(QWidget):
     def __init__(self, on_close):
         super().__init__()
         self.on_close = on_close
-        self.local_ai = {"choice": "none", "coding_agents": {}}
+        self.agent_selection = {"coding_agents": {}}
         self.install_rc = 0
-        self.buzz_state = "not-requested"
         self.coding_agent_states = {
             agent["key"]: "not-requested" for agent in CODING_AGENTS
         }
@@ -2643,6 +2477,10 @@ class InstallPage(QWidget):
         self.title = _label("Setting things up…", 22, TEXT, bold=True)
         self.bar = QProgressBar()
         self.bar.setRange(0, 0)
+        # This bar is busy (0..0) or done/not-done (0..1); its "0%"/"100%"
+        # label said nothing the title does not, and in one stylesheet colour
+        # it could not read on both the gold chunk and the dark trough.
+        self.bar.setTextVisible(False)
         self.log = _label("", 11, MUTED, wrap=True)
 
         lay.addWidget(self.title)
@@ -2658,7 +2496,7 @@ class InstallPage(QWidget):
         self.skip_btn = QPushButton("Finish without optional AI tools")
         self.skip_btn.setFixedHeight(44)
         self.skip_btn.hide()
-        self.skip_btn.clicked.connect(self._skip_buzz)
+        self.skip_btn.clicked.connect(self._skip_agents)
         self.done_btn = QPushButton("Finish")
         self.done_btn.setFixedHeight(44)
         self.done_btn.setEnabled(False)
@@ -2669,15 +2507,12 @@ class InstallPage(QWidget):
         buttons.addWidget(self.done_btn)
         lay.addLayout(buttons)
 
-    def start(self, accent_name, accent_hex, flatpak_ids, local_ai):
-        self.local_ai = local_ai
+    def start(self, flatpak_ids, agent_selection):
+        self.agent_selection = agent_selection
         self.busy = True
-        self.buzz_state = (
-            "pending" if local_ai.get("choice") == "install-buzz" else "not-requested"
-        )
-        selected_agents = local_ai.get("coding_agents")
+        selected_agents = agent_selection.get("coding_agents")
         if not isinstance(selected_agents, dict):
-            selected_agents = {"codex": bool(local_ai.get("codex"))}
+            selected_agents = {"codex": bool(agent_selection.get("codex"))}
         self.coding_agent_states = {
             agent["key"]: (
                 "pending" if selected_agents.get(agent["key"], False) else "not-requested"
@@ -2690,12 +2525,8 @@ class InstallPage(QWidget):
         self.skip_btn.hide()
         self.cancel_btn.setEnabled(True)
         self.cancel_btn.show()
-        (CONFIG_DIR / "accent").write_text(f"{accent_name}\n{accent_hex}\n")
 
-        commands = [
-            ["kwriteconfig6", "--file", "kdeglobals", "--group", "General",
-             "--key", "AccentColor", _rgb(accent_hex)],
-        ]
+        commands = []
         if flatpak_ids:
             commands.append(["flatpak", "remote-add", "--user", "--if-not-exists",
                              "flathub", FLATHUB_URL])
@@ -2704,7 +2535,7 @@ class InstallPage(QWidget):
 
         self.worker = CommandWorker(commands)
         self.worker.progress.connect(self.log.setText)
-        self.worker.finished.connect(self._on_done)
+        self.worker.completed.connect(self._on_done)
         self.worker.start()
 
     def _on_done(self, rc):
@@ -2727,47 +2558,16 @@ class InstallPage(QWidget):
         self._start_next_ai()
 
     def _start_next_ai(self):
-        if self.buzz_state == "pending":
-            self._start_buzz_setup()
-            return
         for agent in CODING_AGENTS:
             if self.coding_agent_states[agent["key"]] == "pending":
                 self._start_coding_agent_setup(agent)
                 return
         self._finalize_setup()
 
-    def _start_buzz_setup(self):
-        helper = shutil.which("shadowfetch-buzz")
-        if not helper:
-            self.buzz_state = "failed"
-            self.failure_details.append(
-                "Buzz: the shadowfetch-buzz helper is missing. Repair shadowfetch-defaults."
-            )
-            self._start_next_ai()
-            return
-        self.buzz_state = "installing"
-        self.busy = True
-        self.output_lines = []
-        self.title.setText("Installing Buzz...")
-        self.log.setText("Running verified preflight checks...")
-        self.bar.setRange(0, 0)
-        self.done_btn.setEnabled(False)
-        self.skip_btn.hide()
-        self.cancel_btn.show()
-        self.buzz_worker = StreamingCommandWorker(
-            [helper, "setup", "--yes", "--no-open"])
-        self.buzz_worker.progress.connect(self._buzz_progress)
-        self.buzz_worker.finished.connect(self._buzz_done)
-        self.buzz_worker.start()
 
-    def _buzz_progress(self, line):
-        if line:
-            self.output_lines.append(line)
-            self.output_lines = self.output_lines[-5:]
-            self.log.setText("\n".join(self.output_lines))
 
     def _cancel_setup(self):
-        for name in ("coding_agent_worker", "buzz_worker", "worker"):
+        for name in ("coding_agent_worker", "worker"):
             worker = getattr(self, name, None)
             if worker is not None and worker.isRunning():
                 self.cancel_btn.setEnabled(False)
@@ -2775,24 +2575,15 @@ class InstallPage(QWidget):
                 worker.cancel()
                 return
 
-    def _buzz_done(self, rc):
-        self.busy = False
-        self.cancel_btn.setEnabled(True)
-        self.cancel_btn.hide()
-        self.bar.setRange(0, 1)
-        self.bar.setValue(1 if rc == 0 else 0)
-        if rc == 0:
-            self.buzz_state = "ready"
-        else:
-            self.buzz_state = "failed"
-            detail = "\n".join(self.output_lines[-5:]) or f"Setup exited with code {rc}."
-            self.failure_details.append(f"Buzz: {detail}")
-        if rc == 130:
-            self._show_interrupted("Buzz")
-            return
-        self._start_next_ai()
 
     def _start_coding_agent_setup(self, agent):
+        if desktop.agent_network_offline():
+            self.coding_agent_states[agent["key"]] = "failed"
+            self.failure_details.append(
+                f"{agent['name']}: the agent network is offline. Turn it on deliberately "
+                "(shadowfetch-agent-network set online) before downloading this agent.")
+            self._start_next_ai()
+            return
         helper = shutil.which(agent["helper"])
         if not helper:
             self.coding_agent_states[agent["key"]] = "failed"
@@ -2819,7 +2610,7 @@ class InstallPage(QWidget):
         command.extend(["setup", "--yes", "--no-open"])
         self.coding_agent_worker = StreamingCommandWorker(command)
         self.coding_agent_worker.progress.connect(self._coding_agent_progress)
-        self.coding_agent_worker.finished.connect(self._coding_agent_done)
+        self.coding_agent_worker.completed.connect(self._coding_agent_done)
         self.coding_agent_worker.start()
 
     def _coding_agent_progress(self, line):
@@ -2863,10 +2654,6 @@ class InstallPage(QWidget):
 
     def _finalize_setup(self):
         ready = []
-        if self.buzz_state == "ready":
-            ready.append(
-                "Buzz Desktop and its private local relay passed every setup check."
-            )
         for agent in CODING_AGENTS:
             if self.coding_agent_states[agent["key"]] == "ready":
                 ready.append(agent["receipt"])
@@ -2875,7 +2662,7 @@ class InstallPage(QWidget):
                 "One or more optional desktop apps were skipped; retry them later from Discover."
             )
 
-        failed = self.buzz_state == "failed" or any(
+        failed = any(
             state == "failed" for state in self.coding_agent_states.values()
         )
         self.bar.setRange(0, 1)
@@ -2888,8 +2675,6 @@ class InstallPage(QWidget):
             self.skip_btn.show()
         else:
             names = []
-            if self.buzz_state == "ready":
-                names.append("Buzz")
             names.extend(
                 agent["name"] for agent in CODING_AGENTS
                 if self.coding_agent_states[agent["key"]] == "ready"
@@ -2905,10 +2690,7 @@ class InstallPage(QWidget):
                     else "Some optional items did not install."
                 )
             self.log.setText("\n".join(ready))
-            if len(names) == 1:
-                self.done_btn.setText(f"Open {names[0]} and finish")
-            else:
-                self.done_btn.setText("Finish")
+            self.done_btn.setText("Connect your services  →")
             self.skip_btn.hide()
         self.done_btn.setEnabled(True)
 
@@ -2916,52 +2698,86 @@ class InstallPage(QWidget):
         if self.busy:
             return
         retry = False
-        if self.buzz_state == "failed":
-            self.buzz_state = "pending"
-            retry = True
         for key, state in self.coding_agent_states.items():
             if state == "failed":
                 self.coding_agent_states[key] = "pending"
                 retry = True
-        if retry or self.buzz_state == "pending" or any(
+        if retry or any(
             state == "pending" for state in self.coding_agent_states.values()
         ):
             self.failure_details = []
             self._start_next_ai()
             return
         WELCOME_DONE_FLAG.touch()
-        ready_agents = [
+        self.on_close([
             agent for agent in CODING_AGENTS
             if self.coding_agent_states[agent["key"]] == "ready"
-        ]
-        ready_count = len(ready_agents) + (1 if self.buzz_state == "ready" else 0)
-        if ready_count == 1 and self.buzz_state == "ready":
-            try:
-                subprocess.Popen(["shadowfetch-buzz", "open"])
-            except OSError as error:
-                QMessageBox.warning(
-                    self, "Buzz is installed",
-                    f"Buzz setup succeeded, but it could not be opened automatically:\n\n{error}")
-        if ready_count == 1 and ready_agents:
-            agent = ready_agents[0]
-            command = [agent["helper"]]
-            if agent["helper_tool"]:
-                command.append(agent["helper_tool"])
-            command.append("open")
-            try:
-                subprocess.Popen(command)
-            except OSError as error:
-                QMessageBox.warning(
-                    self, f"{agent['name']} is installed",
-                    f"{agent['name']} setup succeeded, but it could not be opened "
-                    f"automatically:\n\n{error}")
-        self.on_close()
+        ])
 
-    def _skip_buzz(self):
+    def _skip_agents(self):
         if self.busy:
             return
         WELCOME_DONE_FLAG.touch()
-        self.on_close()
+        self.on_close([])
+
+
+class ShadowCodePage(QWidget):
+    """The last step: hand the person to ShadowCode to connect their services."""
+    def __init__(self, on_close):
+        super().__init__()
+        self.on_close = on_close
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(48, 40, 48, 32)
+        lay.setSpacing(12)
+        lay.addWidget(_label("ONE HARNESS. ALL MODELS.", 11, GOLD, bold=True))
+        lay.addWidget(_label("Connect your services in ShadowCode", 24, TEXT, bold=True))
+        lay.addWidget(_label(
+            "ShadowCode is the coding agent built into this desktop. Open it and go to "
+            "Accounts to connect what you already have. Nothing is connected until you "
+            "sign in there, and ShadowCode never buys credits for you.",
+            12, MUTED, wrap=True))
+        for title, detail in (
+            ("Subscriptions", "Codex, Claude Code, Cursor, Antigravity or Grok, through each vendor's own sign-in."),
+            ("API keys", "An OpenRouter key if you have no subscription: hundreds of models, billed per token."),
+            ("On this computer", "A free model that fits your hardware, run by ShadowCode's bundled runtime."),
+        ):
+            card = Card()
+            row = QVBoxLayout(card)
+            row.setContentsMargins(16, 11, 16, 11)
+            row.addWidget(_label(title, 13, GOLD, bold=True))
+            row.addWidget(_label(detail, 11, MUTED, wrap=True))
+            lay.addWidget(card)
+        self.agents_line = _label("", 11, MUTED, wrap=True)
+        lay.addWidget(self.agents_line)
+        self.error = _label("", 11, RED, wrap=True)
+        lay.addWidget(self.error)
+        lay.addStretch(1)
+        buttons = QHBoxLayout()
+        later = QPushButton("Finish without opening")
+        later.setFixedHeight(44)
+        later.clicked.connect(self.on_close)
+        self.open_btn = QPushButton("Open ShadowCode  →")
+        self.open_btn.setFixedHeight(44)
+        self.open_btn.clicked.connect(self._open)
+        buttons.addWidget(later)
+        buttons.addStretch(1)
+        buttons.addWidget(self.open_btn)
+        lay.addLayout(buttons)
+
+    def show_ready_agents(self, agents):
+        if agents:
+            names = ", ".join(agent["name"] for agent in agents)
+            self.agents_line.setText(f"Installed and ready: {names}. Open them from the application menu.")
+        else:
+            self.agents_line.setText("")
+
+    def _open(self):
+        if open_shadowcode():
+            self.on_close()
+            return
+        self.error.setText(
+            "ShadowCode could not be started. Open it from the application menu, or "
+            "reinstall the shadow-code package from Software.")
 
 
 class ShadowfetchWelcome(QMainWindow):
@@ -2972,23 +2788,29 @@ class ShadowfetchWelcome(QMainWindow):
         self.setMinimumSize(QSize(940, 680))
         self.setStyleSheet(f"""
             QMainWindow {{ background-color: {BG}; }}
-            QWidget {{ color: {TEXT}; }}
+            QWidget {{ color: {TEXT}; background-color: {BG}; }}
             QLabel {{ background: transparent; }}
-            QCheckBox {{ spacing: 10px; }}
+            QCheckBox, QRadioButton {{ spacing: 10px; background: transparent; }}
             QCheckBox::indicator {{
                 width: 18px; height: 18px; border: 2px solid {BORDER};
                 border-radius: 4px; background: {CARD};
             }}
             QCheckBox::indicator:checked {{
-                border-color: {GOLD}; background: {GOLD};
+                border-color: {GOLD}; background: {GOLD}; image: url({CHECK_MARK});
             }}
-            QRadioButton {{ spacing: 10px; }}
+            QCheckBox::indicator:disabled {{ border-color: {BORDER}; background: {BG}; }}
+            /* Radio: the border width never changes between states, so the
+               box stays 20x20 and border-radius 10px keeps it a circle. The
+               selected dot is a radial gradient, not a thicker border. */
             QRadioButton::indicator {{
                 width: 16px; height: 16px; border: 2px solid {MUTED};
                 border-radius: 10px; background: {CARD};
             }}
             QRadioButton::indicator:checked {{
-                border: 5px solid {GOLD}; background: {INK};
+                border-color: {GOLD};
+                background: qradialgradient(cx: 0.5, cy: 0.5, radius: 0.5,
+                    fx: 0.5, fy: 0.5, stop: 0 {GOLD}, stop: 0.52 {GOLD},
+                    stop: 0.62 {CARD}, stop: 1 {CARD});
             }}
             QPushButton {{
                 background-color: {GOLD}; color: {INK};
@@ -3012,14 +2834,17 @@ class ShadowfetchWelcome(QMainWindow):
         self.mode = mode
         self.force = force
         self.watcher = watcher or NMWatcher(self)
-        self.catalog_data = load_catalog()
+        # desktop.catalog_by_id(None) is Welcome's shape - id -> record,
+        # every declared kind - read out of the one implementation. The local
+        # copy this replaces rejected a catalog file holding a JSON array,
+        # which the Control Center's copy accepted, so the two front-ends could
+        # read the same directory and disagree about what was in it.
+        self.catalog_data = desktop.catalog_by_id(None)
         self.sizes = load_sizes()
 
-        self.accent_name = ACCENTS[0][0]
-        self.accent_hex = ACCENTS[0][1]
         self.profiles = []
         self.flatpaks = []
-        self.local_ai = {"choice": "none", "coding_agents": {}}
+        self.agent_selection = {"coding_agents": {}}
 
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
@@ -3042,24 +2867,22 @@ class ShadowfetchWelcome(QMainWindow):
 
         show_badge = not IGNITION_DONE.exists()
         self.welcome = WelcomePage(
-            lambda: self.stack.setCurrentWidget(self.element_page),
+            lambda: self.stack.setCurrentWidget(self.profile),
             on_ignition=(lambda: self.stack.setCurrentWidget(self.flow))
             if show_badge else None,
             on_catalog=lambda: self.stack.setCurrentWidget(self.catalog_page),
             on_guide=open_system_guide,
             on_workbench=open_workbench)
-        self.element_page = ElementPage(
-            lambda: self.stack.setCurrentWidget(self.profile))
         self.profile = ProfilePage(self._got_profiles)
         self.wifi = WiFiPage(lambda: self.stack.setCurrentWidget(self.graphics))
-        self.graphics = GraphicsPage(lambda: self.stack.setCurrentWidget(self.accent))
-        self.accent = AccentPage(self._got_accent)
+        self.graphics = GraphicsPage(lambda: self.stack.setCurrentWidget(self.apps))
         self.apps = AppsPage(self._got_apps)
-        self.buzz = BuzzPage(self._got_buzz)
-        self.install = InstallPage(self.close)
+        self.agent_setup = AgentSetupPage(self._got_agents)
+        self.install = InstallPage(self._got_install)
+        self.shadowcode = ShadowCodePage(self.close)
 
-        for w in (self.flow, self.welcome, self.element_page, self.profile, self.wifi,
-                  self.graphics, self.accent, self.apps, self.buzz,
+        for w in (self.flow, self.welcome, self.profile, self.wifi,
+                  self.graphics, self.apps, self.agent_setup, self.shadowcode,
                   self.install, self.catalog_page):
             self.stack.addWidget(w)
 
@@ -3096,22 +2919,21 @@ class ShadowfetchWelcome(QMainWindow):
     def _got_profiles(self, profiles):
         self.profiles = profiles
         self.apps.apply_profiles(profiles)
-        self.buzz.apply_profiles(profiles)
+        self.agent_setup.apply_profiles(profiles)
         self.stack.setCurrentWidget(self.wifi)
-
-    def _got_accent(self, name, hexc):
-        self.accent_name, self.accent_hex = name, hexc
-        self.stack.setCurrentWidget(self.apps)
 
     def _got_apps(self, flatpaks):
         self.flatpaks = flatpaks
-        self.stack.setCurrentWidget(self.buzz)
+        self.stack.setCurrentWidget(self.agent_setup)
 
-    def _got_buzz(self, local_ai):
-        self.local_ai = local_ai
+    def _got_agents(self, agent_selection):
+        self.agent_selection = agent_selection
         self.stack.setCurrentWidget(self.install)
-        self.install.start(self.accent_name, self.accent_hex, self.flatpaks,
-                           self.local_ai)
+        self.install.start(self.flatpaks, self.agent_selection)
+
+    def _got_install(self, ready_agents):
+        self.shadowcode.show_ready_agents(ready_agents)
+        self.stack.setCurrentWidget(self.shadowcode)
 
 
 class SessionController(QObject):

@@ -1,0 +1,313 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://www.shadowfetchlinux.org/schema/provider-manifest-1.json",
+  "title": "Shadowfetch agent provider manifest",
+  "description": "Declarative description of one agent provider. Providers are DATA plus an adapter module; nothing is discovered by scanning arbitrary Python. Every security-relevant fact a provider may rely on at runtime must be declared here, because the registry and the release gate both validate this document and the runtime refuses anything it does not declare.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "display_name",
+    "interface_version",
+    "adapter_module",
+    "adapter_class",
+    "capabilities",
+    "credential_ids",
+    "network_policy",
+    "sandbox_profile",
+    "package",
+    "version"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Version of THIS manifest format. Bumped only when the format changes incompatibly.",
+      "const": 1
+    },
+    "id": {
+      "description": "Stable provider identity, persisted in the mission row. Never reused for a different provider.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{1,38}[a-z0-9]$"
+    },
+    "display_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 60
+    },
+    "interface_version": {
+      "description": "Which AgentProvider ABI the adapter implements. The registry refuses a provider whose interface_version it does not support, rather than importing it and failing later.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "adapter_module": {
+      "description": "Python module implementing the adapter. Resolved ONLY against the packaged provider module root; never an arbitrary path, never a dotted traversal.",
+      "type": "string",
+      "pattern": "^sf_provider_[a-z0-9_]{1,40}$"
+    },
+    "adapter_class": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Za-z0-9]{2,48}$"
+    },
+    "capabilities": {
+      "description": "What this provider can perform. Capability is WHAT the user wants; the provider is WHO performs it. A provider may not perform a capability it does not list here, and the registry will not offer it for one.",
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "code_change",
+          "sourced_report",
+          "media_export"
+        ]
+      }
+    },
+    "credential_ids": {
+      "description": "Credential IDENTITIES this provider may be given. Never credential values. An empty array means the provider gets no credentials at all, and the invocation builder will refuse to pass any.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Z][A-Z0-9_]{2,60}$"
+      }
+    },
+    "credential_aliases": {
+      "description": "Historical environment variable names that also satisfy a declared credential identity. Declared as data so the orchestrator does not need a per-provider branch to honour an older spelling. Each alias maps to an identity that must itself appear in credential_ids.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^[A-Z][A-Z0-9_]{2,60}$"
+      },
+      "propertyNames": {
+        "pattern": "^[A-Z][A-Z0-9_]{2,60}$"
+      }
+    },
+    "network_policy": {
+      "description": "The MOST network this provider may ever request. 'none' means the sandbox is run with an unshared network namespace. 'allowlist' additionally requires a non-empty egress_allowlist. The adapter cannot widen this at invocation time; the registry clamps it.",
+      "enum": [
+        "none",
+        "allowlist"
+      ]
+    },
+    "egress_allowlist": {
+      "description": "Hosts this provider states it will contact when network_policy is 'allowlist'. NOT ENFORCED: Firebreak has two network postures, none and allow, and no destination filter, so a provider with 'allowlist' reaches whatever the host reaches. This is a declaration recorded for audit and for a future egress filter -- it is not a permission, and nothing compares it to where packets actually went.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^(\\*\\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+      }
+    },
+    "sandbox_profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workspace_mode",
+        "memory_mb",
+        "cpu_seconds",
+        "processes"
+      ],
+      "properties": {
+        "workspace_mode": {
+          "description": "read-only: the provider may not modify the workspace at all. workspace-write: it may write inside the mission workspace and nowhere else.",
+          "enum": [
+            "read-only",
+            "workspace-write"
+          ]
+        },
+        "memory_mb": {
+          "type": "integer",
+          "minimum": 256,
+          "maximum": 32768,
+          "description": "The floor matches Firebreak's own bound (Firebreak refuses anything under 256); a lower one would let a manifest pass every check and then fail at run time."
+        },
+        "cpu_seconds": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 7200
+        },
+        "processes": {
+          "type": "integer",
+          "minimum": 8,
+          "maximum": 512,
+          "description": "The floor matches Firebreak's own bound (Firebreak refuses anything under 8); a lower one would let a manifest pass every check and then fail at run time."
+        },
+        "read_grants": {
+          "description": "Absolute paths the provider may read outside its workspace. Each is passed to Firebreak as an explicit --read grant. The firebreak denylist still applies on top: no filesystem root, no whole home directory, no credential store.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^/[^\\0]*$"
+          }
+        },
+        "account_mount": {
+          "description": "A named credential store the sandbox should mount for this provider. Declared as data so the orchestrator forwards it without knowing which provider asked: there is no provider name in the execution path.",
+          "enum": [
+            "codex-account"
+          ]
+        },
+        "masked_paths": {
+          "description": "Paths this provider states must not be visible to it. NOT ENFORCED: Firebreak has no masking flag, so these paths reach no mechanism. They are checked on widening -- an adapter may add masks and never drop one -- and recorded for audit. Do not rely on them for containment; a path that must be invisible must not be inside the workspace or a read grant.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^/[^\\0]*$"
+          }
+        }
+      }
+    },
+    "executable": {
+      "description": "How the provider's program is located. PATH resolution is not an option, deliberately: Phase 1 removed several PATH- and environment-selected privileged executables and this format does not allow the class back in. See the kind field for the forms available.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind"
+      ],
+      "properties": {
+        "kind": {
+          "description": "How the program is located. 'absolute' is one fixed path. 'candidates' is an ordered list of absolute or ~-relative globs, tried in order -- this is the preferred form because the manifest, not the environment, decides what may run. 'none' means the provider runs nothing. PATH lookup is not an option in any form.",
+          "enum": [
+            "absolute",
+            "candidates",
+            "none"
+          ]
+        },
+        "trust": {
+          "description": "How far outside the packaging system this provider's program is permitted to live. It is a REQUIREMENT, not a description: at run time the program is classified from the ownership and mode of the file and of every directory above it, and refused unless the class is one this declaration accepts. 'system' (the default) accepts only a distro-managed program. 'user-runtime' also accepts one in the invoking user's own space, which is how npm and pip CLIs are really installed. 'developer' also accepts an unmanaged root-owned location and is not for shipped providers. A program a third party could substitute is refused under every declaration. The approved-provider policy carries its own executable_trust ceiling, and the narrower of the two wins.",
+          "enum": [
+            "system",
+            "user-runtime",
+            "developer"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^/[^\\0]*$"
+        },
+        "candidates": {
+          "description": "Ordered absolute or ~-relative globs. The first existing executable that passes the trust tier is used. Later entries are fallbacks, so put packaged locations first.",
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^(~/|/)[^\\0]*$"
+          }
+        },
+        "runtime_root_markers": {
+          "description": "Directory names that, if found among the executable path's parents, mark the root of its runtime distribution. The sandbox is given read access to that root so the program can load its own files. Declared as data so the orchestrator needs no per-provider knowledge; without it only the executable's own directory is granted.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[@A-Za-z0-9._-]{1,64}$"
+          }
+        },
+        "helper_programs": {
+          "description": "Other absolute programs this provider may execute, beyond the one its kind/path/candidates resolve to. NOT fallbacks -- a helper is a different tool used for a different step, the way an exporter runs ffprobe to inspect and ffmpeg to encode. Declaring one is how the provider gets permission to run it: verify_invocation() refuses any program that is neither the resolved one nor a declared helper, and a helper is classified for executable trust exactly like the main program. Keep the list minimal; each entry is a program the provider may run inside the sandbox with its credentials and network grant.",
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^/[^\\0]*$"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "absolute"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "path"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "candidates"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "candidates"
+            ]
+          }
+        }
+      ]
+    },
+    "package": {
+      "description": "Debian package that ships this manifest and its adapter. The gate checks the manifest is actually owned by the package it claims.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9+.-]+$"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+"
+    },
+    "notes": {
+      "type": "string",
+      "maxLength": 2000
+    }
+  },
+  "allOf": [
+    {
+      "description": "An allowlist network policy without an allowlist would be an unbounded grant wearing a policy's name.",
+      "if": {
+        "properties": {
+          "network_policy": {
+            "const": "allowlist"
+          }
+        },
+        "required": [
+          "network_policy"
+        ]
+      },
+      "then": {
+        "required": [
+          "egress_allowlist"
+        ],
+        "properties": {
+          "egress_allowlist": {
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "description": "A provider that declares no network must not carry an egress allowlist, so the two can never disagree.",
+      "if": {
+        "properties": {
+          "network_policy": {
+            "const": "none"
+          }
+        },
+        "required": [
+          "network_policy"
+        ]
+      },
+      "then": {
+        "properties": {
+          "egress_allowlist": {
+            "maxItems": 0
+          }
+        }
+      }
+    }
+  ]
+}

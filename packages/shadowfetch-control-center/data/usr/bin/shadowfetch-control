@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Shadowfetch Control Center - one window runs the machine.
 
-3.5.0 "Fire and Ice": eight fixed sections - Guide, Element Workbench, Ignite
-(Ember Mode), Watch (Firewatch), Recover (Phoenix), Local AI, Drivers, and
+Mission Control: persistent missions, ShadowCode, featured Grok Bot,
+optional agents, Guide, Workbench, Ignite, Watch, Recover, Workspaces, Drivers, and
 Software & Updates.
-The system tools (Safe Update, System Health, AI Workspaces, Local AI Tools,
+The system tools (Safe Update, System Health, Workspaces,
 First-run Setup, Graphics & Recovery) all remain reachable inside their
-sections; nothing the old front door offered has been removed.
+sections. An on-device model provider ships; no model is bundled, so local
+inference needs a model the user supplies.
 """
 
 # ---- --help / --version, BEFORE any other import ----------------------------
@@ -22,21 +23,27 @@ if any(_a in ("-h", "--help") for _a in _sfsys.argv[1:]):
 USAGE
   shadowfetch-control                    open the control centre
   shadowfetch-control --page SECTION     open a section directly
+  shadowfetch-control --workspace PATH   create a mission for a project folder
   shadowfetch-control --cli              text-mode menu (no graphics needed)
 
 SECTIONS (for --page; a tab may follow after a colon)
-  guide      Private, read-only System Passport (aliases: passport)
+  missions    Persistent mission queue, results, changes and review
+  shadowcode  ShadowCode, the preinstalled coding agent: status and launch
+  grok-bot    Official Grok Bot desktop installation and launch
+  optional-agents  Optional agents you can install into your home folder
+  workbench   Project profiles and scoped workspaces
+  guide       Private, read-only System Passport (aliases: passport)
   ignite      Ember Mode - one switch for speed, always returns to Balanced
-  watch       Firewatch - live sensors, the heat map, local model telemetry
+  watch       Firewatch - live sensors, the heat map and storage health
   recover     Phoenix - restore Points, repair tools, recovery report
-  local-ai    Buzz, local model status and workspaces (aliases: ai, agents)
+  workspaces  Private project folders (aliases: local-ai, ai, agents)
   drivers     Graphics, network and printer hardware
   software    Software & Updates - updates and one-click bundles
 
   Examples: --page watch:heatmap    --page recover:point=42
 
 WHAT IT DOES
-  A front end to compatibility, speed, visibility, recovery, updates and local AI.
+  A front end to compatibility, speed, visibility, recovery, updates and workspaces.
   Actions are confirmed; privileged steps go through polkit. If a Control
   Center window is already open, --page routes inside that window.
 
@@ -62,14 +69,14 @@ def cli() -> int:
     print("  1) System Passport")
     print("  2) Safe Update")
     print("  3) System Health")
-    print("  4) AI Workspaces")
-    print("  5) Local AI Tools")
+    print("  4) Workspaces")
+    print("  5) Grok Bot")
     print("  6) Graphics & Recovery")
     try:
         choice = input("Choose [1-6]: ").strip()
     except EOFError:
         return 0
-    commands = {"1": "shadowfetch-passport", "2": "shadowfetch-update", "3": "shadowfetch-health", "4": "shadowfetch-agent-workspace", "5": "shadowfetch-agent-tools", "6": "shadowfetch-recovery"}
+    commands = {"1": "shadowfetch-passport", "2": "shadowfetch-update", "3": "shadowfetch-health", "4": "shadowfetch-agent-workspace", "5": ["shadowfetch-grok-bot", "open"], "6": "shadowfetch-recovery"}
     command = commands.get(choice)
     return subprocess.call(command) if command else 0
 

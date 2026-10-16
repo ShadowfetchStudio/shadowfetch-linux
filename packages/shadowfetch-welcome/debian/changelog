@@ -1,3 +1,58 @@
+shadowfetch-welcome (5.0.1-1) umbra; urgency=medium
+
+  * Rebuilt for Shadowfetch Linux 5.0.1: shadowfetch-desktop requires every
+    Shadowfetch package at the same version. No changes to this package.
+
+ -- Shadowfetch Project <signing@shadowfetch.com>  Wed, 30 Sep 2026 23:15:00 -0400
+
+shadowfetch-welcome (5.0.0-1) umbra; urgency=medium
+
+  * BREAKING: the Fire/Ice element page and the accent/wallpaper page are
+    removed. Welcome uses one ShadowCode palette (gold #F2B33D, steel
+    #BCC0C6).
+  * The agent setup page sets the agent network (Online, recommended, or
+    Offline) and offers exactly three optional agents: Grok Bot, Hermes and
+    OpenClaw. Offline pauses all three. The Codex, Claude Code, Grok Build
+    and Cursor Agent installers are no longer offered.
+  * New last page, "Connect your services in ShadowCode": explains
+    subscriptions, OpenRouter API keys and local models, and opens
+    /usr/bin/shadowcode with the session PATH so it finds the person's own
+    vendor CLIs.
+  * The "Agent workspace" profile preselects the three optional agents; the
+    Developer profile preselects none.
+
+ -- Shadowfetch Project <signing@shadowfetch.com>  Mon, 28 Sep 2026 18:30:00 -0400
+
+shadowfetch-welcome (4.1.0-1) umbra; urgency=medium
+
+  * Adopt the one shared desktop library from shadowfetch-defaults for the
+    bundle catalog, the hwscan freshness rule, the helper paths and the
+    privileged install argv, in place of this package's own copies. The
+    import is a hard failure rather than a silent fallback -- a wizard that
+    shows an empty catalog is worse than one that says the install is broken
+    -- so this adds Depends: shadowfetch-defaults (= ${binary:Version}).
+  * shadowfetch-bundle-install stops being a second decider of update state.
+    It commits packages as root and derived a Phoenix Point with its own CSV
+    parser, then offered that number to the user as a restore target while
+    recording it nowhere. The Point now comes from sfupdate.snapshots, the
+    transaction is recorded through sfupdate.state before the Point is
+    offered to anybody, and a Point that cannot be recorded is not named.
+  * Close the sys.modules loader hole the Control Center had.
+
+ -- Shadowfetch Project <signing@shadowfetch.com>  Wed, 09 Sep 2026 18:28:58 -0400
+
+shadowfetch-welcome (4.0.0-1) umbra; urgency=medium
+
+  * Defer local inference and remove Buzz setup while retaining featured Grok and coding-agent setup.
+  * Shadowfetch Linux 4.0 Mission Control release.
+  * Scope privacy wording to local records and selected setup actions,
+    with vendor onboarding and network behavior described separately.
+  * Integrate persistent missions, scoped execution and featured Grok Bot setup.
+  * Keep setup profile disclosures readable and every wallpaper reachable at
+    the minimum window size with scrollable choices and fixed navigation.
+
+ -- Shadowfetch Project <signing@shadowfetch.com>  Sat, 05 Sep 2026 03:00:00 +0000
+
 shadowfetch-welcome (3.5.0-1) umbra; urgency=medium
 
   * Shadowfetch Linux 3.5.0 flagship Fire and Ice Workbench release.

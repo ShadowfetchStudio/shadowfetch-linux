@@ -20,10 +20,26 @@ Depends:
  dbus,
  polkitd,
  pkexec,
+# Load-bearing in two ways, not one. The rollback button has always run
+# /usr/libexec/phoenix-restore. Since Stage U, /usr/lib/shadowfetch/sfupdate
+# also IMPORTS phoenix.trusted: the executable-trust classifier is shared
+# rather than duplicated, because two implementations of "can somebody other
+# than root substitute this binary" is the defect, not the fix. Demoting this
+# to Recommends breaks fireproofd at import.
  shadowfetch-phoenix
 Recommends:
  snapper,
  libnotify-bin
+# This package writes sfcc/fireproof_page.py into the Python package that
+# shadowfetch-control-center owns, and the Control Center imports it by name
+# from software_page.py. Until this line, neither debian/control mentioned the
+# other: a cross-package module drop with no declared relationship in either
+# direction, which is exactly the edge a partial install breaks and a full ISO
+# hides. Enhances is the accurate relation -- Fireproof is complete on its own
+# (fireproof(1), fireproofd, the apt hooks), and the page is an addition to
+# another package -- so it declares the seam without dragging PyQt6 and the
+# whole desktop onto a headless install.
+Enhances: shadowfetch-control-center
 Description: Shadowfetch Fireproof safe system updates
  Fireproof is how Shadowfetch Linux updates itself. Opening the analyze
  screen takes no apt lock and downloads nothing: the pending upgrade is
