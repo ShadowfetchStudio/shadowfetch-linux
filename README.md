@@ -28,14 +28,14 @@ Nothing is connected until you sign in. Welcome's last step opens ShadowCode so 
 | --- | --- |
 | Version / codename | 5.0.1 / Umbra |
 | Edition | ShadowCode — "One Harness. All Models." |
-| Publication date / channel | 2026-09-30 / stable |
+| Publication date / channel | 5.0.0 ISO 2026-09-30, 5.0.1 APT update 2026-10-01 / stable |
 | ISO | shadowfetch-5.0.0-amd64.iso |
 | Size | 4085778432 bytes |
 | SHA-256 | `2d8a72e044e8061bd616b2b4668425cc4d4ec0480a98975f961c0e58cba95e21` |
 | ISO product source commit / tree | `9587a7ca348e817870baffa9d390754acf331266` / `2986e02421fc6af1353ce7e7b7695a390c724acf` |
 | Base / desktop | Debian testing snapshot 20260929T000000Z / KDE Plasma 6.7.4 |
 | Kernel | Linux 7.2.6 |
-| ShadowCode | 1.0.0 (`shadow-code`, republished unmodified from the signed upstream `.deb`) |
+| ShadowCode | 1.0.0 on the 5.0.0 ISO; the 5.0.1 update installs 1.0.1 (`shadow-code`, republished unmodified from the signed upstream `.deb`) |
 | Architecture / APT suite | amd64 / `umbra` |
 | Final boot acceptance | 18 prepublication cases in `qa/5.0.0/acceptance.json`, recorded against this ISO: 12 pass, 6 waived by the release owner with written reasons; `PUB-01` is proven after publication |
 
@@ -138,5 +138,7 @@ Patches to packages, build tools, tests and documentation are welcome. Run `make
 ## Licensing
 
 The ISO aggregates upstream packages under their respective licenses. Each Shadowfetch package states its license in its `debian/copyright`: Shadowfetch's own packages (and the packaged `grub-btrfs`) are GPL-3.0-or-later, matching this repository's [LICENSE](LICENSE); the Breeze-derived `shadowfetch-themes` is LGPL-2.1-or-later. The DrKonqi pickup helper's own code and packaging use **GPL-3.0-only**; its compiled KDE source retains **GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL**, and its source package includes the upstream archive, signature, release key and downstream patch. ShadowCode is **Apache-2.0** and its bundled components keep their own licenses; its corresponding source is published beside the APT repository under `pool/third-party-source/shadow-code/`. Other upstream source retains its original license notices. Shadowfetch and Umbra names, marks and artwork are reserved under [TRADEMARKS.md](TRADEMARKS.md); rebrand derivative distributions. Optional vendor applications retain their own licenses and terms. Shadowfetch Linux is independent and does not imply Debian or vendor endorsement.
+
+Like this project? You can [buy me a coffee](https://www.buymeacoffee.com/shadowfetcu).
 
 [Docs](https://www.shadowfetchlinux.org/docs) · [Security model](https://www.shadowfetchlinux.org/security) · [Release feed](https://www.shadowfetchlinux.org/releases.json) · [Previous 4.1 release](RELEASE-4.1.0.md)
