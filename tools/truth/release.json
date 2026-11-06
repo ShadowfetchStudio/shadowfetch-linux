@@ -12,7 +12,7 @@
   ],
   "authority": "tools/release/versions/<version>.toml  ([release] table)",
   "urls": {
-    "public_site": "https://www.shadowfetchlinux.org",
+    "public_site": "https://www.shadowfetch.com/downloads",
     "artifact_base": "https://www.shadowfetch.com/linux",
     "_note": "Also stated in the Makefile as PUBLIC_SITE / ARTIFACT_BASE."
   },

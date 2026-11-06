@@ -71,7 +71,7 @@ volume top-level (mount -o subvolid=5) and, before the exchange, to
 interrupted restore left behind; `phoenix-recover resume` finishes or
 undoes it. Both run automatically on the next boot.
 
-Part of Shadowfetch Linux. https://www.shadowfetchlinux.org/
+Part of Shadowfetch Linux. https://www.shadowfetch.com/downloads
 SFHELP
 }
 

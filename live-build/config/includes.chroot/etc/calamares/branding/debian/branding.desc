@@ -14,11 +14,11 @@ strings:
     versionedName:       Shadowfetch Linux 2.1.5 (Umbra)
     shortVersionedName:  Shadowfetch 2.1.5
     bootloaderEntryName: Shadowfetch
-    productUrl:          https://www.shadowfetchlinux.org/
-    supportUrl:          https://www.shadowfetchlinux.org/support
-    knownIssuesUrl:      https://www.shadowfetchlinux.org/issues
-    releaseNotesUrl:     https://www.shadowfetchlinux.org/
-    donateUrl:           https://www.shadowfetchlinux.org/donate
+    productUrl:          https://www.shadowfetch.com/downloads
+    supportUrl:          https://www.shadowfetch.com/downloads#shadowfetch-linux
+    knownIssuesUrl:      https://github.com/ShadowfetchStudio/shadowfetch-linux/issues
+    releaseNotesUrl:     https://www.shadowfetch.com/downloads
+    donateUrl:           https://buymeacoffee.com/shadowfetch
 
 sidebar: widget
 navigation: widget

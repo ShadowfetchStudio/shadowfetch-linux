@@ -38,7 +38,7 @@ WHAT IT DOES
       sudo dpkg --configure -a && sudo apt -f install
   and exit with status 3.
 
-Part of Shadowfetch Linux. https://www.shadowfetchlinux.org/"""
+Part of Shadowfetch Linux. https://www.shadowfetch.com/downloads"""
 
 if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
     print(USAGE)

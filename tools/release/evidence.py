@@ -34,7 +34,7 @@ VERSION: str = ""
 CODENAME: str = ""
 EDITION: str = ""
 SUBTITLE: str = ""
-WEBSITE = "https://www.shadowfetchlinux.org"
+WEBSITE = "https://www.shadowfetch.com/downloads"
 GITHUB = "https://github.com/Shadowfetchapps/shadowfetch-linux"
 
 # mounted_iso() opens the shipped image; unsquashfs supplies the dpkg inventory

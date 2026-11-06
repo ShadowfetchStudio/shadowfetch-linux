@@ -47,7 +47,7 @@ WHAT IT DOES
   Actions are confirmed; privileged steps go through polkit. If a Control
   Center window is already open, --page routes inside that window.
 
-Part of Shadowfetch Linux. https://www.shadowfetchlinux.org/""")
+Part of Shadowfetch Linux. https://www.shadowfetch.com/downloads""")
     raise SystemExit(0)
 if "--version" in _sfsys.argv[1:]:
     print("shadowfetch-control (Shadowfetch Linux) " + (open("/usr/share/shadowfetch/version").read().strip() if _sfsos.path.exists("/usr/share/shadowfetch/version") else "unknown"))

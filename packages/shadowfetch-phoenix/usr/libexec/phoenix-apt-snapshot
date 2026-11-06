@@ -45,7 +45,7 @@ The only file written is /etc/default/snapper, and the only key written is
 DISABLE_APT_SNAPSHOT. Every other line of that file is preserved byte for
 byte. No other argument is accepted.
 
-Part of Shadowfetch Linux. https://www.shadowfetchlinux.org/
+Part of Shadowfetch Linux. https://www.shadowfetch.com/downloads
 SFHELP
 }
 

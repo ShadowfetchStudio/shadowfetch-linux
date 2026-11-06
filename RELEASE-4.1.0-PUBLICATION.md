@@ -316,7 +316,7 @@ The worker's own README is honest about this and dates it:
 ```
 $ curl -sSI https://www.shadowfetch.com/linux/releases.json | grep -i "^HTTP\|^location"
 HTTP/2 301
-location: https://www.shadowfetchlinux.org/releases.json
+location: https://www.shadowfetch.com/downloadsreleases.json
 ```
 
 `src/index.js:124` routes that path to `releaseJson(env)`, so either the
@@ -560,7 +560,7 @@ OpenPGP fingerprint: 8F13CE1535EE1F4A2916A1F73C5C900B7BE80CA1
 Firebreak source commit: e1293bfad3bffaecd1ff869e378438f9f36398f7
 Acceptance commit: 57e637a712d0a337017ad820a89d84ebcc04f255
 ...
-Website: https://www.shadowfetchlinux.org/download
+Website: https://www.shadowfetch.com/downloads
 Source: https://github.com/ShadowfetchLinux/shadowfetch-linux/releases/tag/v4.0.0
 ```
 
@@ -655,7 +655,7 @@ It is an Astro site wrapped in Cloudflare Worker `shadowfetch-linux-site`
 split:
 
 > - Worker: `shadowfetch-linux-site`
-> - Canonical host: `https://www.shadowfetchlinux.org`
+> - Canonical host: `https://www.shadowfetch.com/downloads`
 > - Do not attach Worker `shadowfetch-linux` as the public site (artifact Worker).
 > - APT, GPG, ISO bytes, and `_stats` stay on `https://www.shadowfetch.com/linux/...`
 
@@ -666,7 +666,7 @@ serves the **bytes** behind `shadowfetch.com/linux/*`. Confirmed live:
 ```
 $ curl -sSI https://www.shadowfetch.com/linux/ | grep -i "^HTTP\|^location"
 HTTP/2 301
-location: https://www.shadowfetchlinux.org/
+location: https://www.shadowfetch.com/downloads
 $ for p in / /download /changelog /verify /releases.json /preview; do … done
 root code=200 / /download 200 / /changelog 200 / /verify 200 / /releases.json 200 / /preview 200
 ```
@@ -820,8 +820,8 @@ wrangler."*
 ### 6.6 What success looks like
 
 Wrangler prints `Deployed shadowfetch-linux-site`;
-`https://www.shadowfetchlinux.org/download` names
-`shadowfetch-4.1.0-amd64.iso`; `https://www.shadowfetchlinux.org/releases.json`
+`https://www.shadowfetch.com/downloads` names
+`shadowfetch-4.1.0-amd64.iso`; `https://www.shadowfetch.com/downloadsreleases.json`
 has `latest.version == "4.1.0"`; the Atom feed's newest entry says 4.1.0.
 
 ### 6.7 Failure mode if done in the wrong order

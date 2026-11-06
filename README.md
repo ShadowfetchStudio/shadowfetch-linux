@@ -14,13 +14,13 @@ ShadowCode 1.0 explains itself: every approval card says what the action does, h
 
 Nothing is connected until you sign in. Welcome's last step opens ShadowCode so you can connect what you have. 5.0 also **changes behaviour that 4.1 setups depend on**: Fire and Ice are gone, several commands are removed, and the Fire/Ice network switch is now a separate setting. Read the [release notes](RELEASE-5.0.0.md) before upgrading.
 
-![ShadowCode 1.0 on the Shadowfetch Linux 5.0 desktop](https://www.shadowfetchlinux.org/linux-assets/linux-5.0.0-shadowcode.webp)
+![ShadowCode 1.0 on the Shadowfetch Linux 5.0 desktop](https://www.shadowfetch.com/downloadslinux-assets/linux-5.0.0-shadowcode.webp)
 
-![Shadowfetch Linux 5.0 Welcome, with Open ShadowCode first](https://www.shadowfetchlinux.org/linux-assets/linux-5.0.0-welcome.webp)
+![Shadowfetch Linux 5.0 Welcome, with Open ShadowCode first](https://www.shadowfetch.com/downloadslinux-assets/linux-5.0.0-welcome.webp)
 
-![Mission Control 5.0 with ShadowCode, Grok Bot and Hermes & OpenClaw in the sidebar](https://www.shadowfetchlinux.org/linux-assets/linux-5.0.0-mission-control.webp)
+![Mission Control 5.0 with ShadowCode, Grok Bot and Hermes & OpenClaw in the sidebar](https://www.shadowfetch.com/downloadslinux-assets/linux-5.0.0-mission-control.webp)
 
-[Download](https://www.shadowfetchlinux.org/download) · [Screenshots](https://www.shadowfetchlinux.org/screenshots) · [Release notes](RELEASE-5.0.0.md) · [ShadowCode](https://github.com/ShadowfetchStudio/ShadowCode)
+[Download](https://www.shadowfetch.com/downloads) · [Screenshots](https://www.shadowfetch.com/downloadsscreenshots) · [Release notes](RELEASE-5.0.0.md) · [ShadowCode](https://github.com/ShadowfetchStudio/ShadowCode)
 
 ## Current release
 
@@ -64,7 +64,7 @@ No Shadowfetch account is required. No API keys, account sessions or model weigh
 
 ## Verify and install
 
-The [download page](https://www.shadowfetchlinux.org/download) links the ISO, checksum and detached signature. The SBOM (`sbom-5.0.0.cdx.json`), package manifest (`packages-5.0.0.manifest`) and QA evidence bundle (`evidence-bundle-5.0.0.tar.gz`) are attached to the [v5.0.0 GitHub release](https://github.com/ShadowfetchStudio/shadowfetch-linux/releases/tag/v5.0.0). Use the exact accepted filename below. These commands download and verify files; they do not write a USB device.
+The [download page](https://www.shadowfetch.com/downloads) links the ISO, checksum and detached signature. The SBOM (`sbom-5.0.0.cdx.json`), package manifest (`packages-5.0.0.manifest`) and QA evidence bundle (`evidence-bundle-5.0.0.tar.gz`) are attached to the [v5.0.0 GitHub release](https://github.com/ShadowfetchStudio/shadowfetch-linux/releases/tag/v5.0.0). Use the exact accepted filename below. These commands download and verify files; they do not write a USB device.
 
 ```sh
 ISO='shadowfetch-5.0.0-amd64.iso'
@@ -80,9 +80,9 @@ gpg --verify "$ISO.asc" "$ISO"
 sha256sum --check "$ISO.sha256"
 ```
 
-Continue only after the signature and checksum both verify. A GPG warning about personal key trust differs from a failed signature. Write the verified ISO with a USB image writer, then follow the [installation guide](https://www.shadowfetchlinux.org/install).
+Continue only after the signature and checksum both verify. A GPG warning about personal key trust differs from a failed signature. Write the verified ISO with a USB image writer, then follow the [installation guide](https://www.shadowfetch.com/downloadsinstall).
 
-The boot menu offers a normal entry and an "agents offline" entry; the installer carries that choice to the installed system. The live session uses `shadow` / `shadow` with passwordless sudo. The installer creates the chosen user and removes the live account. See the [verification guide](https://www.shadowfetchlinux.org/verify), [Secure Boot guide](https://www.shadowfetchlinux.org/secure-boot) and [known issues](https://www.shadowfetchlinux.org/known-issues).
+The boot menu offers a normal entry and an "agents offline" entry; the installer carries that choice to the installed system. The live session uses `shadow` / `shadow` with passwordless sudo. The installer creates the chosen user and removes the live account. See the [verification guide](https://www.shadowfetch.com/downloads#shadowfetch-linux), [Secure Boot guide](https://www.shadowfetch.com/downloadssecure-boot) and [known issues](https://www.shadowfetch.com/downloads#shadowfetch-linux).
 
 **Upgrading from 4.1 or 5.0.0 to 5.0.1:** run `sudo apt update` then `sudo apt full-upgrade` for this update (not `fireproof update`: the Fireproof on 4.1 and 5.0.0 can stop partway when it updates itself). From 5.0.1 on, `fireproof update` is safe again and never removes packages. Read the [release notes](RELEASE-5.0.0.md) first; the upgrade removes `shadowfetch-element`, `shadowfetch-codex` and `shadowfetch-code-agent`, and moves an Ice machine to the offline agent network.
 
@@ -139,4 +139,4 @@ Patches to packages, build tools, tests and documentation are welcome. Run `make
 
 The ISO aggregates upstream packages under their respective licenses. Each Shadowfetch package states its license in its `debian/copyright`: Shadowfetch's own packages (and the packaged `grub-btrfs`) are GPL-3.0-or-later, matching this repository's [LICENSE](LICENSE); the Breeze-derived `shadowfetch-themes` is LGPL-2.1-or-later. The DrKonqi pickup helper's own code and packaging use **GPL-3.0-only**; its compiled KDE source retains **GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL**, and its source package includes the upstream archive, signature, release key and downstream patch. ShadowCode is **Apache-2.0** and its bundled components keep their own licenses; its corresponding source is published beside the APT repository under `pool/third-party-source/shadow-code/`. Other upstream source retains its original license notices. Shadowfetch and Umbra names, marks and artwork are reserved under [TRADEMARKS.md](TRADEMARKS.md); rebrand derivative distributions. Optional vendor applications retain their own licenses and terms. Shadowfetch Linux is independent and does not imply Debian or vendor endorsement.
 
-[Docs](https://www.shadowfetchlinux.org/docs) · [Security model](https://www.shadowfetchlinux.org/security) · [Release feed](https://www.shadowfetchlinux.org/releases.json) · [Previous 4.1 release](RELEASE-4.1.0.md)
+[Docs](https://www.shadowfetch.com/downloads#shadowfetch-linux) · [Security model](https://www.shadowfetch.com/downloads#shadowfetch-linux) · [Release feed](https://www.shadowfetch.com/downloadsreleases.json) · [Previous 4.1 release](RELEASE-4.1.0.md)

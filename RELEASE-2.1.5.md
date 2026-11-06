@@ -13,7 +13,7 @@ and the public artifacts were verified after publication.
 - Signing key: `8F13 CE15 35EE 1F4A 2916  A1F7 3C5C 900B 7BE8 0CA1`
 - Evidence bundle: `work/release-2.1.5/evidence-bundle-2.1.5.tar.gz`
   (sha256 `7b4737416759436567bac1224a8722c46e1d675d74fe7a1e9f51eaf16fc436fe`)
-- Canonical website: https://www.shadowfetchlinux.org
+- Canonical website: https://www.shadowfetch.com/downloads
 - Download: https://www.shadowfetch.com/linux/download/shadowfetch-2.1.5-amd64.iso
 
 ## Release goal
@@ -51,7 +51,7 @@ explicitly save the redacted report as HTML or JSON.
   installed desktop.
 - Make Guide the first Control Center section and expose **Check this computer**
   from both Ignition and Welcome.
-- Make `https://www.shadowfetchlinux.org` the canonical product website.
+- Make `https://www.shadowfetch.com/downloads` the canonical product website.
 - Make `https://github.com/ShadowfetchLinux/shadowfetch-linux` the canonical
   source and issue-tracking repository.
 - Preserve the currently verified APT and ISO object routes until equivalent
