@@ -37,7 +37,7 @@ WHY THIS EXISTS
   the postinst would leave the package half-configured, which is the problem
   this exists to prevent.
 
-Part of Shadowfetch Linux. https://www.shadowfetchlinux.org/
+Part of Shadowfetch Linux. https://www.shadowfetch.com/downloads
 """
 
 import os

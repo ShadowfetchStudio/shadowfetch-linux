@@ -14,7 +14,7 @@ VERSION  ?= 5.0.1
 CODENAME ?= umbra
 ISO_NAME := shadowfetch-$(VERSION)-amd64.iso
 VERSION_TOKEN := $(subst .,_,$(VERSION))
-PUBLIC_SITE ?= https://www.shadowfetchlinux.org
+PUBLIC_SITE ?= https://www.shadowfetch.com/downloads
 ARTIFACT_BASE ?= https://www.shadowfetch.com/linux
 
 # Real source packages — each has its own debian/ tree.

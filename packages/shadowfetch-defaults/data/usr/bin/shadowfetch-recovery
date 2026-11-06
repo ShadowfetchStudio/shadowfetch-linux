@@ -14,7 +14,7 @@ shadowfetch-recovery - Recovery helper: rollback and repair entry points.
 USAGE
   shadowfetch-recovery     show recovery options
 
-Part of Shadowfetch Linux. https://www.shadowfetchlinux.org/
+Part of Shadowfetch Linux. https://www.shadowfetch.com/downloads
 SFHELP
     exit 0 ;;
   --version)

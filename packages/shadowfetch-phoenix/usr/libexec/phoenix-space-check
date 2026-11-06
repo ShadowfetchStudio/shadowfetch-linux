@@ -24,7 +24,7 @@ phoenix-space-check - pre-transaction Btrfs free-space guard (apt hook).
 USAGE
   phoenix-space-check     reclaim space if <10% free; warn if still <2 GiB
 
-Part of Shadowfetch Linux. https://www.shadowfetchlinux.org/
+Part of Shadowfetch Linux. https://www.shadowfetch.com/downloads
 SFHELP
     exit 0 ;;
   --version)

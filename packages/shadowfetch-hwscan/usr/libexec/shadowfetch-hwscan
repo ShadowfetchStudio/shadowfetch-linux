@@ -22,7 +22,7 @@ House rules:
     read-only probes; failure or overrun means "unknown", never an
     error.
 
-Part of Shadowfetch Linux. https://www.shadowfetchlinux.org/
+Part of Shadowfetch Linux. https://www.shadowfetch.com/downloads
 """
 
 import argparse

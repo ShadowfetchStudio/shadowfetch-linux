@@ -38,7 +38,7 @@ WHAT IT DOES
 
   Nothing here mutates the system and nothing leaves the machine.
 
-Part of Shadowfetch Linux. https://www.shadowfetchlinux.org/""")
+Part of Shadowfetch Linux. https://www.shadowfetch.com/downloads""")
     raise SystemExit(0)
 if "--version" in _sfsys.argv[1:]:
     print("firewatchd (Shadowfetch Linux) "

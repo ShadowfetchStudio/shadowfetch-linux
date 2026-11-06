@@ -19,7 +19,7 @@ WHAT IT DOES
   IT when finished. Grants the browser read-only access for the transfer
   only, then revokes it.
 
-Part of Shadowfetch Linux. https://www.shadowfetchlinux.org/
+Part of Shadowfetch Linux. https://www.shadowfetch.com/downloads
 SFHELP
     exit 0 ;;
   --version)

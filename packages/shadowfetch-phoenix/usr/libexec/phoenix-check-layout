@@ -40,7 +40,7 @@ USAGE
 Exit status: 0 layout usable (warnings may be printed), 1 layout broken.
 Reads only; it never changes the system.
 
-Part of Shadowfetch Linux. https://www.shadowfetchlinux.org/
+Part of Shadowfetch Linux. https://www.shadowfetch.com/downloads
 SFHELP
     exit 0 ;;
   --version)

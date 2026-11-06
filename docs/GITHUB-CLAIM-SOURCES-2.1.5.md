@@ -26,7 +26,7 @@ checked source and exact-artifact evidence. Development work is not a release.
 
 ## Guardrails
 
-- Keep `https://www.shadowfetchlinux.org` and
+- Keep `https://www.shadowfetch.com/downloads` and
   `https://github.com/ShadowfetchLinux/shadowfetch-linux` canonical.
 - Keep verified raw APT and ISO routes unchanged until replacements are tested
   as raw, cache-correct, byte-identical endpoints rather than HTML routes.

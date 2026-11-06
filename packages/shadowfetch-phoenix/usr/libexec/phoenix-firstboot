@@ -22,7 +22,7 @@ phoenix-firstboot - one-shot Phoenix Recovery setup (run by systemd at first boo
 USAGE
   phoenix-firstboot        arm snapper + grub-btrfsd on a Btrfs root
 
-Part of Shadowfetch Linux. https://www.shadowfetchlinux.org/
+Part of Shadowfetch Linux. https://www.shadowfetch.com/downloads
 SFHELP
     exit 0 ;;
   --version)

@@ -60,7 +60,7 @@ class FireEdition215Tests(unittest.TestCase):
             self.assertIn(f"({version}-1)", first, changelog)
 
     def test_canonical_identity_keeps_verified_raw_artifact_routes(self):
-        canonical = "https://www.shadowfetchlinux.org"
+        canonical = "https://www.shadowfetch.com/downloads"
         repository = "https://github.com/Shadowfetchapps/shadowfetch-linux"
         artifact_base = "https://www.shadowfetch.com/linux"
         os_release = (
@@ -68,7 +68,7 @@ class FireEdition215Tests(unittest.TestCase):
             / "packages/shadowfetch-branding/data/usr/share/shadowfetch/"
             "os-release.shadowfetch"
         ).read_text()
-        self.assertIn(f'HOME_URL="{canonical}/"', os_release)
+        self.assertIn(f'HOME_URL="{canonical}"', os_release)
         self.assertIn(f'BUG_REPORT_URL="{repository}/issues"', os_release)
 
         makefile = (ROOT / "Makefile").read_text()

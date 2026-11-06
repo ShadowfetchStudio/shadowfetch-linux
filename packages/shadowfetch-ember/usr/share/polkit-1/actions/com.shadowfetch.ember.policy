@@ -5,7 +5,7 @@
 <policyconfig>
 
   <vendor>Shadowfetch Project</vendor>
-  <vendor_url>https://www.shadowfetchlinux.org/</vendor_url>
+  <vendor_url>https://www.shadowfetch.com/downloads</vendor_url>
 
   <!--
     com.shadowfetch.ember.duration guards the pkexec ember-duration

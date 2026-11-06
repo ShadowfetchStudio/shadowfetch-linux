@@ -42,7 +42,7 @@ USAGE
   phoenix-postboot     resume an interrupted restore (phoenix-recover),
                        then run update-grub if a restore flagged it
 
-Part of Shadowfetch Linux. https://www.shadowfetchlinux.org/
+Part of Shadowfetch Linux. https://www.shadowfetch.com/downloads
 SFHELP
     exit 0 ;;
   --version)

@@ -29,7 +29,7 @@
 # difference is real and worth stating plainly: the retirement completes at
 # the next boot rather than inside the interactive update transaction.
 #
-# Part of Shadowfetch Linux. https://www.shadowfetchlinux.org/
+# Part of Shadowfetch Linux. https://www.shadowfetch.com/downloads
 set -euo pipefail
 
 # Absolute, never resolved through PATH: this program decides which binary
@@ -71,7 +71,7 @@ THE FIVE STEPS, WHICH ARE NOT INTERCHANGEABLE
 
 `--check` performs SIMULATE only. It does not approve, commit or verify.
 
-Part of Shadowfetch Linux. https://www.shadowfetchlinux.org/
+Part of Shadowfetch Linux. https://www.shadowfetch.com/downloads
 SFHELP
 }
 

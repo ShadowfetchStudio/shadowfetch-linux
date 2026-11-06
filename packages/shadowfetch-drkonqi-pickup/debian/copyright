@@ -1,6 +1,6 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: shadowfetch-drkonqi-pickup
-Source: https://www.shadowfetchlinux.org/
+Source: https://www.shadowfetch.com/downloads
 Comment: Includes the complete unmodified KDE DrKonqi 6.6.5 source archive,
  detached signature and release public key. See vendor/provenance.json.
 

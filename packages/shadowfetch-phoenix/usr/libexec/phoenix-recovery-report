@@ -42,7 +42,7 @@ smartctl JSON summaries without drive serials, os-release.
 
 Nothing leaves this machine.
 
-Part of Shadowfetch Linux. https://www.shadowfetchlinux.org/
+Part of Shadowfetch Linux. https://www.shadowfetch.com/downloads
 SFHELP
     exit 0 ;;
   --version)

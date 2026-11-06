@@ -4,7 +4,7 @@ Priority: optional
 Maintainer: Shadowfetch Project <maintainers@shadowfetch.com>
 Build-Depends: debhelper-compat (= 13)
 Standards-Version: 4.6.2
-Homepage: https://www.shadowfetchlinux.org/
+Homepage: https://www.shadowfetch.com/downloads
 
 Package: shadowfetch-themes
 Architecture: all

@@ -28,7 +28,7 @@ class CalamaresContractTests(unittest.TestCase):
     def test_requirements_use_private_https_probe(self) -> None:
         welcome = (CALAMARES / "modules/welcome.conf").read_text(encoding="utf-8")
         self.assertIn(
-            "internetCheckUrl:   https://www.shadowfetchlinux.org/", welcome
+            "internetCheckUrl:   https://www.shadowfetch.com/", welcome
         )
         self.assertNotIn("http://example.com", welcome)
 
