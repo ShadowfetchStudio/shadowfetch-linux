@@ -80,9 +80,9 @@ gpg --verify "$ISO.asc" "$ISO"
 sha256sum --check "$ISO.sha256"
 ```
 
-Continue only after the signature and checksum both verify. A GPG warning about personal key trust differs from a failed signature. Write the verified ISO with a USB image writer, then follow the [installation guide](https://www.shadowfetch.com/downloadsinstall).
+Continue only after the signature and checksum both verify. A GPG warning about personal key trust differs from a failed signature. Write the verified ISO with a USB image writer, then follow the [installation guide](https://www.shadowfetchlinux.org/install).
 
-The boot menu offers a normal entry and an "agents offline" entry; the installer carries that choice to the installed system. The live session uses `shadow` / `shadow` with passwordless sudo. The installer creates the chosen user and removes the live account. See the [verification guide](https://www.shadowfetch.com/downloads#shadowfetch-linux), [Secure Boot guide](https://www.shadowfetch.com/downloadssecure-boot) and [known issues](https://www.shadowfetch.com/downloads#shadowfetch-linux).
+The boot menu offers a normal entry and an "agents offline" entry; the installer carries that choice to the installed system. The live session uses `shadow` / `shadow` with passwordless sudo. The installer creates the chosen user and removes the live account. See the [verification guide](https://www.shadowfetchlinux.org/verify), [Secure Boot guide](https://www.shadowfetchlinux.org/secure-boot) and [known issues](https://www.shadowfetchlinux.org/known-issues).
 
 **Upgrading from 4.1 or 5.0.0 to 5.0.1:** run `sudo apt update` then `sudo apt full-upgrade` for this update (not `fireproof update`: the Fireproof on 4.1 and 5.0.0 can stop partway when it updates itself). From 5.0.1 on, `fireproof update` is safe again and never removes packages. Read the [release notes](RELEASE-5.0.0.md) first; the upgrade removes `shadowfetch-element`, `shadowfetch-codex` and `shadowfetch-code-agent`, and moves an Ice machine to the offline agent network.
 
@@ -141,4 +141,4 @@ The ISO aggregates upstream packages under their respective licenses. Each Shado
 
 Like this project? You can [buy me a coffee](https://www.buymeacoffee.com/shadowfetcu).
 
-[Docs](https://www.shadowfetch.com/downloads#shadowfetch-linux) · [Security model](https://www.shadowfetch.com/downloads#shadowfetch-linux) · [Release feed](https://www.shadowfetch.com/downloadsreleases.json) · [Previous 4.1 release](RELEASE-4.1.0.md)
+[Docs](https://www.shadowfetchlinux.org/docs) · [Security model](https://www.shadowfetchlinux.org/security) · [Release feed](https://www.shadowfetchlinux.org/releases.json) · [Previous 4.1 release](RELEASE-4.1.0.md)
